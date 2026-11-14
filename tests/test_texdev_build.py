@@ -264,3 +264,26 @@ def test_a_live_build_writes_no_upper_or_clues(tmp_path):
     # build() is unchanged: the texdev files come only from texdev_build.
     import inspect
     assert "build_upper_and_clues" not in inspect.getsource(run_build.build)
+
+
+def test_clue_files_are_the_same_bytes_from_one_process_or_several(tmp_path, monkeypatch):
+    steps = [0, 1, 2]
+    squares = ["N40W125", "N40W120", "N45W125"]
+    for out, n in (("one", "1"), ("many", "3")):
+        monkeypatch.setenv("CLUE_WORKERS", n)
+        assert texdev_build.build(tmp_path / out, tmp_path / f"state-{out}", tmp_path / "work", _deps(steps=steps),
+                                  steps=steps, workers=2, squares=squares) == run_build.BUILT
+    one = sorted((tmp_path / "one" / "texdev" / "clues").rglob("*.icx"))
+    assert len(one) == len(squares)
+    for f in one:
+        assert f.read_bytes() == (tmp_path / "many" / f.relative_to(tmp_path / "one")).read_bytes()
+    # The hours differ, so a worker's result landing on the wrong hour would show.
+    d = decode_clue_square(one[0].read_bytes())
+    assert bytes(d["clues"][0]) != bytes(d["clues"][2])
+
+
+def test_clue_workers_reads_the_env_and_falls_back_to_every_core():
+    import os
+    assert run_build.clue_workers({"CLUE_WORKERS": "5"}) == 5
+    for bad in ({}, {"CLUE_WORKERS": "0"}, {"CLUE_WORKERS": "x"}):
+        assert run_build.clue_workers(bad) == (os.cpu_count() or 1)

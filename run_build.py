@@ -8,6 +8,7 @@ import argparse
 import concurrent.futures as cf
 import datetime as dt
 import json
+import multiprocessing as mp
 import os
 import shutil
 import subprocess
@@ -878,9 +879,36 @@ def node_clue_bytes(col, up, rows=None):
     return clues.encode_clues(clues.deck_clues(prof), clues.node_clues(prof))
 
 
-def clue_cubes(names, stride, window, stacks, col_by_hour):
+def clue_workers(env=None):
+    """Processes for the clue step: CLUE_WORKERS, or every core (the step is
+    pure Python, one node at a time, and was 73 % of a texdev build's time)."""
+    env = os.environ if env is None else env
+    try:
+        n = int(env.get("CLUE_WORKERS", "0"))
+    except ValueError:
+        n = 0
+    return n if n > 0 else (os.cpu_count() or 1)
+
+
+def _clue_hour(job):
+    """u8 [nodes][N_BYTES]: the clue bytes of every node at one hour. job is
+    (upper u16 [fields][nodes], column u16 [fields][nodes] or None): small
+    enough to hand to another process, which needs nothing else."""
+    up, col = job
+    col_rows = [f for f in column_spec() if f[1] != columns.STATIC]
+    rows = profile_rows()
+    upv = _phys_rows(up, upper_spec())
+    colv = None if col is None else _phys_rows(col, col_rows)
+    b = np.empty((up.shape[1], clues.N_BYTES), dtype=np.uint8)
+    for i in range(up.shape[1]):
+        b[i] = np.frombuffer(node_clue_bytes(None if colv is None else colv[:, i], upv[:, i], rows), np.uint8)
+    return b
+
+
+def clue_cubes(names, stride, window, stacks, col_by_hour, workers=1):
     """{square: u8 [hours][side][side][30]} — each node computed once, even
-    where squares share an edge."""
+    where squares share an edge. workers > 1 computes the hours in that many
+    processes (the same bytes), a few hours handed over at a time."""
     local = {name: _local_nodes(name, stride, window) for name in names}
     nodes = sorted({(r, c) for rr, cc in local.values() for r in rr for c in cc})
     at = {rc: i for i, rc in enumerate(nodes)}
@@ -889,18 +917,27 @@ def clue_cubes(names, stride, window, stacks, col_by_hour):
     gather = {name: np.array([[at[(r, c)] for c in cc] for r in rr]) for name, (rr, cc) in local.items()}
     n = columns.side(stride)
     out = {name: np.empty((len(stacks), n, n, clues.N_BYTES), dtype=np.uint8) for name in names}
-    col_rows = [f for f in column_spec() if f[1] != columns.STATIC]
-    up_rows = upper_spec()
-    rows = profile_rows()
-    for k, (h, up) in enumerate(stacks):
-        upv = _phys_rows(up[:, nr, nc], up_rows)
+
+    def job(k):
+        h, up = stacks[k]
         col = col_by_hour.get(h)
-        colv = None if col is None else _phys_rows(col[:, nr, nc], col_rows)
-        b = np.empty((len(nodes), clues.N_BYTES), dtype=np.uint8)
-        for i in range(len(nodes)):
-            b[i] = np.frombuffer(node_clue_bytes(None if colv is None else colv[:, i], upv[:, i], rows), np.uint8)
+        return up[:, nr, nc], None if col is None else col[:, nr, nc]
+
+    def keep(k, b):
         for name in names:
             out[name][k] = b[gather[name]]
+
+    workers = min(max(1, workers), max(1, len(stacks)))
+    if workers == 1:
+        for k in range(len(stacks)):
+            keep(k, _clue_hour(job(k)))
+        return out
+    # "spawn": a fresh interpreter each, never a fork of this threaded one.
+    with cf.ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
+        for k0 in range(0, len(stacks), 2 * workers):
+            ks = range(k0, min(len(stacks), k0 + 2 * workers))
+            for k, b in zip(ks, pool.map(_clue_hour, [job(k) for k in ks])):
+                keep(k, b)
     return out
 
 
@@ -924,13 +961,13 @@ def write_upper(blob_dir, run, names, stride, window, stacks, workers=1):
         return sum(pool.map(one, names))
 
 
-def write_clues(blob_dir, run, names, stride, window, stacks, col_by_hour):
+def write_clues(blob_dir, run, names, stride, window, stacks, col_by_hour, workers=1):
     """One .icx per square under clues/<run>/; returns the bytes written."""
     hours = [h for h, _ in stacks]
     tiles = Path(blob_dir) / site.clues_path(run)
     tiles.mkdir(parents=True, exist_ok=True)
     total = 0
-    for name, cube in clue_cubes(names, stride, window, stacks, col_by_hour).items():
+    for name, cube in clue_cubes(names, stride, window, stacks, col_by_hour, workers).items():
         lat, lon = parse_name(name)
         data = cluefile.encode_clue_square(lat, lon, int(round(columns.spacing_deg(stride) * 1000)), hours, cube)
         (tiles / f"{name}.icx").write_bytes(data)
@@ -992,7 +1029,7 @@ def build_upper_and_clues(blob_dir, state, work, deps, kit, run, steps, squares,
         hours = [h for h, _ in stacks]
         up_bytes = write_upper(blob_dir, run, names, stride, window, stacks, workers)
         t1 = time.monotonic()
-        clue_bytes = write_clues(blob_dir, run, names, stride, window, stacks, col_by_hour)
+        clue_bytes = write_clues(blob_dir, run, names, stride, window, stacks, col_by_hour, clue_workers())
     except Exception as e:
         print(f"::warning::upper air failed: {type(e).__name__}: {e}")
         for root in (site_upper_root(), site_clues_root()):
