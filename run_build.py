@@ -1037,7 +1037,7 @@ def build_upper_and_clues(blob_dir, state, work, deps, kit, run, steps, squares,
         return None, None
     print(f"upper air: {len(names)} squares, {len(hours)} steps ({len(past_up)} history), "
           f"ICU1 {up_bytes / 1e6:.1f} MB, {cluefile.FORMAT} {clue_bytes / 1e6:.1f} MB, {time.monotonic() - t0:.0f} s "
-          f"(clues {time.monotonic() - t1:.0f} s)")
+          f"(clues {time.monotonic() - t1:.0f} s, {clue_workers()} workers on {os.cpu_count()} cores)")
     return (_tex_entry("ICU1", run, hours, len(past_up), stride, site.upper_path(run)),
             _tex_entry(cluefile.FORMAT, run, hours, len(past_up), stride, site.clues_path(run)))
 
