@@ -25,10 +25,49 @@ export function manifestFolders(m) {
 export const PROTECTED_PREFIXES = ['texdev/'];
 export const isProtected = (p) => PROTECTED_PREFIXES.some((k) => p.startsWith(k));
 
-/** Pathnames to delete: everything but manifest.json, the kept folders and PROTECTED_PREFIXES. */
-export function pathsToDelete(pathnames, { current, previous }) {
+// RUN HISTORY (2026-11-16, HRRR and RRFS only: BLOB_KEEP_RUN_HOURS in
+// hrrr.yml and rrfs.yml). Those feeds' manifests carry no history steps, so a
+// SkyCast report that reaches the server hours after its shot (Erik's sunrise
+// timelapse that day: 2 h, after two failed uploads in the field) found the
+// run that was on already deleted. With keepHours set, a publish also writes
+// the run's own manifest to runs/<run>.json (blob.mjs) and keeps, for every run
+// begun within keepHours of the current one, its clouds and thickness folders
+// (RUN_KEEP_FAMILIES) and that file. The app's server fill (SkyCast
+// src/reportfill.js regionalRunAtShot) reads the run that was live at a shot
+// from them. Fog folders are NOT kept (HRRR's are ~500 MB a run).
+export const RUN_KEEP_FAMILIES = ['tiles', 'thick'];
+const HOUR_MS = 3600000;
+
+/** '2026111619' for 2026-11-16T19Z (a run folder's name). */
+export function runIdOf(runMs) {
+  return new Date(runMs).toISOString().slice(0, 13).replace(/[-T]/g, '');
+}
+
+/** The run file a publish writes beside manifest.json. */
+export const runFilePath = (runMs) => `runs/${runIdOf(runMs)}.json`;
+
+/** ms of a 'YYYYMMDDHH' run id, else NaN. */
+export function runIdMs(id) {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})$/.exec(String(id));
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4]) : NaN;
+}
+
+/** Is this path a kept run's clouds, thickness or run file (begun at or after sinceMs)? */
+export function keptRunPath(p, sinceMs) {
+  const file = /^runs\/(\d{10})\.json$/.exec(p);
+  if (file) return runIdMs(file[1]) >= sinceMs;
+  const r = runFolder(p);
+  return !!r && RUN_KEEP_FAMILIES.includes(r.family) && runIdMs(r.run) >= sinceMs;
+}
+
+/**
+ * Pathnames to delete: everything but manifest.json, the kept folders and
+ * PROTECTED_PREFIXES — and, with keepHours, the run history (above).
+ */
+export function pathsToDelete(pathnames, { current, previous, keepHours = 0 }) {
   const keep = [...manifestFolders(current), ...manifestFolders(previous)];
-  return pathnames.filter((p) => p !== 'manifest.json' && !isProtected(p) && !keep.some((k) => p.startsWith(k)));
+  const sinceMs = keepHours > 0 && current && Number.isFinite(current.runMs) ? current.runMs - keepHours * HOUR_MS : Infinity;
+  return pathnames.filter((p) => p !== 'manifest.json' && !isProtected(p) && !keep.some((k) => p.startsWith(k)) && !keptRunPath(p, sinceMs));
 }
 
 // The one-off backlog cleanup (prune-backlog.mjs). From Nov 1 every publish's

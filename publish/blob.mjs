@@ -25,7 +25,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { put, list, del } from '@vercel/blob';
-import { pathsToDelete } from './prune.mjs';
+import { pathsToDelete, runFilePath } from './prune.mjs';
 import { planRoots } from './roots.mjs';
 import { createRetry, paceDelay, filesToSend } from './pace.mjs';
 import { pruneOldRuns, DELETES_PER_SEC } from './sweep.mjs';
@@ -61,6 +61,8 @@ async function pool(items, n, fn) {
 
 // Deletes a second (sweep.mjs): 100 a batch, so 1 call a second by default.
 const DEL_PER_SEC = Number(process.env.BLOB_DELETES_PER_SEC) || DELETES_PER_SEC;
+// Hours of runs to keep (prune.mjs RUN HISTORY); unset or 0 keeps only the current and previous run.
+const KEEP_RUN_HOURS = Number(process.env.BLOB_KEEP_RUN_HOURS) || 0;
 
 const listAll = () => listStore(list, retry);
 
@@ -100,15 +102,37 @@ async function main() {
 
   // publishedMs (or, on a copy of a live manifest, republishedMs): when every
   // reader has it — now plus the 60 s cache (stamp.mjs), stamped on each attempt.
-  await retry('manifest.json', async () => put('manifest.json', stampManifest(await readFile(join(manifestDir, 'manifest.json')), Date.now(), MANIFEST_S * 1000), {
-    access: 'public', addRandomSuffix: false, allowOverwrite: true,
-    cacheControlMaxAge: MANIFEST_S, contentType: 'application/json',
-  }));
+  let stamped = null;
+  await retry('manifest.json', async () => {
+    stamped = stampManifest(await readFile(join(manifestDir, 'manifest.json')), Date.now(), MANIFEST_S * 1000);
+    return put('manifest.json', stamped, {
+      access: 'public', addRandomSuffix: false, allowOverwrite: true,
+      cacheControlMaxAge: MANIFEST_S, contentType: 'application/json',
+    });
+  });
   console.log(`manifest.json → run ${current.run}`);
+
+  // RUN HISTORY (prune.mjs; HRRR and RRFS set BLOB_KEEP_RUN_HOURS): the run's
+  // own manifest, exactly as it went live, at runs/<run>.json — written after
+  // manifest.json, so a run file exists only for a run that went out. A fog
+  // republish rewrites it with republishedMs. A failure here never fails the
+  // publish (the run is live); a late report for this run then finds no file.
+  const keepHours = KEEP_RUN_HOURS;
+  if (keepHours > 0 && Number.isFinite(current.runMs)) {
+    try {
+      await retry('run file', () => put(runFilePath(current.runMs), stamped, {
+        access: 'public', addRandomSuffix: false, allowOverwrite: true,
+        cacheControlMaxAge: MANIFEST_S, contentType: 'application/json',
+      }));
+      console.log(`${runFilePath(current.runMs)} written; keeping ${keepHours} h of runs`);
+    } catch (e) {
+      console.log(`::warning::blob publish: run ${current.run} is live, but its run file did not go up (${(e && e.message) || e})`);
+    }
+  }
 
   // From here on the publish has worked: the new run is live. A failed prune
   // leaves old files for the next publish's prune, never a red build.
-  await pruneOldRuns({ listAll, pathsToDelete, current, previous, del, retry, perSec: DEL_PER_SEC });
+  await pruneOldRuns({ listAll, pathsToDelete: (paths, o) => pathsToDelete(paths, { ...o, keepHours }), current, previous, del, retry, perSec: DEL_PER_SEC });
 }
 
 main().catch((e) => { console.error(`::error::blob publish failed: ${e.message || e}`); process.exit(1); });

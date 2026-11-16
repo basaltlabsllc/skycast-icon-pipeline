@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize } from './prune.mjs';
+import { manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize, runIdOf, runIdMs, runFilePath } from './prune.mjs';
 
 const cur = { tiles: 'tiles/2026100200', tail: { tiles: 'tail/2026100200' } };
 const prev = { tiles: 'tiles/2026100118', tail: { tiles: 'tail/2026100112' } };
@@ -113,4 +113,37 @@ test('texdev/ is never pruned, by the publish or by the backlog sweep', () => {
   const paths = ['manifest.json', 'tiles/a/x.icl', 'texdev/2026111206/N40W125.icu', 'texdev/manifest.json'];
   assert.deepEqual(pathsToDelete(paths, { current: { tiles: 'tiles/b' }, previous: null }), ['tiles/a/x.icl']);
   assert.deepEqual(backlogToDelete(['tiles/a/x.icl', 'tiles/b/x.icl', 'texdev/2026111206/N40W125.icu', 'texdev/2026111200/N40W125.icu'], { tiles: 'tiles/b' }), []);
+});
+
+// RUN HISTORY: HRRR/RRFS keep 48 h of clouds + thickness + run files for SkyCast's late report fills.
+// computed: python3 datetime → 2026-11-16T19:00Z = 1794855600000
+test('run ids name the hour in UTC, both ways', () => {
+  assert.equal(runIdOf(1794855600000), '2026111619');
+  assert.equal(runIdMs('2026111619'), 1794855600000);
+  assert.equal(runFilePath(1794855600000), 'runs/2026111619.json');
+  assert.ok(Number.isNaN(runIdMs('20261116190')));
+});
+
+test('with keepHours, runs begun within it keep their clouds, thickness and run file; fog and older runs go', () => {
+  const current = { runMs: 1794855600000, tiles: 'tiles/2026111619', thick: { tiles: 'thick/2026111619' }, fog: { tiles: 'fog/2026111619' } };
+  const previous = { runMs: 1794852000000, tiles: 'tiles/2026111618', thick: { tiles: 'thick/2026111618' }, fog: { tiles: 'fog/2026111618' } };
+  const paths = [
+    'manifest.json',
+    'tiles/2026111619/a.icl', 'thick/2026111619/a.ict', 'fog/2026111619/x/0.icc', 'runs/2026111619.json',
+    'tiles/2026111618/a.icl', 'fog/2026111618/x/0.icc',
+    // 19Z − 48 h = 2026-11-14T19Z: kept; 18Z that day is 49 h back: gone
+    'tiles/2026111419/a.icl', 'thick/2026111419/a.ict', 'fog/2026111419/x/0.icc', 'runs/2026111419.json',
+    'tiles/2026111418/a.icl', 'thick/2026111418/a.ict', 'runs/2026111418.json',
+    'texdev/a.bin',
+  ];
+  assert.deepEqual(pathsToDelete(paths, { current, previous, keepHours: 48 }), [
+    'fog/2026111419/x/0.icc',
+    'tiles/2026111418/a.icl', 'thick/2026111418/a.ict', 'runs/2026111418.json',
+  ]);
+  // Without it (every other feed), only the current and previous runs stay, run files included.
+  assert.deepEqual(pathsToDelete(paths, { current, previous }), [
+    'runs/2026111619.json',
+    'tiles/2026111419/a.icl', 'thick/2026111419/a.ict', 'fog/2026111419/x/0.icc', 'runs/2026111419.json',
+    'tiles/2026111418/a.icl', 'thick/2026111418/a.ict', 'runs/2026111418.json',
+  ]);
 });

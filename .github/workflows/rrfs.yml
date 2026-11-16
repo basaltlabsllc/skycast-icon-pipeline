@@ -36,6 +36,8 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           BLOB_READ_WRITE_TOKEN: ${{ secrets.RRFS_BLOB_READ_WRITE_TOKEN }}
+          # Keep 48 h of runs (clouds, thickness, runs/<run>.json) for SkyCast reports filled late (publish/prune.mjs RUN HISTORY).
+          BLOB_KEEP_RUN_HOURS: "48"
         run: |
           end=$(( $(date +%s) + 5 * 3600 ))
           while [ "$(date +%s)" -lt "$end" ]; do
