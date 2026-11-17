@@ -206,7 +206,7 @@ def test_build_gfs_writes_thickness_over_main_steps_only(small, tmp_path):
     base = int(RUN.timestamp() // 3600)
     assert man["historySteps"] == 6                       # the squares carry history ...
     assert man["thick"] == {"format": "ICT1", "run": "2026-11-08T00Z", "runMs": int(RUN.timestamp() * 1000),
-                            "tiles": thick_path(RUN)}
+                            "tiles": thick_path(RUN), "pack": thick_path(RUN) + "/pack"}
     assert thick_path(RUN) == "thick/2026110800"
     for n in SQUARES:
         d = blocks.decode_blocks((tmp_path / "o" / thick_path(RUN) / f"{n}.ict").read_bytes(), 2)

@@ -14,6 +14,11 @@
 #                          20 degree groups (pipeline/wind.py), over main + tail
 #                          steps, for models with wind=True. A failure drops the
 #                          wind key and files; the cover is published anyway.
+#   <folder>/<run>/pack/   PACK1 (pipeline/pack.py): each folder above as one
+#                          all.bin + index.json; the manifest names it beside
+#                          the folder (tilesPack, blocksPack, tail/thick/wind
+#                          .pack). FEED_TILE_FILES=0 drops the per-file keys of
+#                          the packed folders. A failed pack drops its key only.
 #   manifest.json
 # Memory follows hrrr/build.py: each worker reads one hour, puts it on the
 # feed's grid and cuts it straight into per-square uint8 [4][41][41] slices,
@@ -28,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import blocks, history, published, thick, wind
+from pipeline import blocks, history, pack, published, thick, wind
 from pipeline.dwd import run_id, run_iso
 from pipeline.encode import encode_square, quantize
 from pipeline.site import blocks_path, build_manifest, tail_path, thick_path, tiles_path, wind_path
@@ -238,6 +243,7 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
     excepted: see build_thick). steps limits the forecast hours (a sample run:
     no tail, the manifest says complete: false, the history head is not saved)."""
     started = clock()
+    tile_files = pack.tile_files_on()     # FEED_TILE_FILES, read once per build
     if steps is not None:
         model = dataclasses.replace(model, main_steps=tuple(sorted(set(int(s) for s in steps))), tail_steps=())
     names = all_squares()
@@ -282,6 +288,11 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
     _write(out_dir, blocks_path(run), names, hours, per_hour, ".icb",
            lambda lat, lon, h, cube: blocks.encode_blocks(b"ICL2", lat, lon, h, cube))
     del per_hour, past, own
+    # One PACK1 pack per folder (pipeline/pack.py), each written as soon as its
+    # folder is, so the packing time counts against the wind budget below like
+    # everything else. A failed pack is a ::warning:: and no key, never a failed build.
+    packs = {"tiles": pack.try_pack(out_dir, tiles_path(run)),
+             "blocks": pack.try_pack(out_dir, blocks_path(run))}
 
     tail = None
     if model.tail_steps:
@@ -290,8 +301,11 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
         _write(out_dir, tail_path(run), names, tail_hours, tail_cut, ".icl", encode_square)
         tail = {"run": run_iso(run), "runMs": int(run.timestamp() * 1000),
                 "stepsMs": [h * 3600 * 1000 for h in tail_hours], "tiles": tail_path(run)}
+        packs["tail"] = pack.try_pack(out_dir, tail_path(run))
 
     thickness = build_thick(model, run, out_dir, get, sleep, names)
+    if thickness:
+        packs["thick"] = pack.try_pack(out_dir, thick_path(run))
     # The whole build runs under the workflow's timeout: wind gets what is left
     # of it minus a margin, so a slow cover can never lose the manifest to wind.
     wind_budget = min(WIND_BUDGET_S, WORKFLOW_TIMEOUT_S - (clock() - started) - WIND_MARGIN_S)
@@ -300,6 +314,8 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
         wind_entry = None
     else:
         wind_entry = build_wind(model, run, out_dir, get, sleep, budget_s=wind_budget)
+    if wind_entry:
+        packs["wind"] = pack.try_pack(out_dir, wind_path(run))
     try:
         hist_runs = published.history_runs(state, run)
         hist_since = published.since(state)
@@ -315,5 +331,6 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
         m["wind"] = wind_entry
     m["model"] = model.name
     m["attribution"] = model.attribution
+    m = pack.add_pack_keys(m, packs, tile_files=tile_files)
     (Path(out_dir) / "manifest.json").write_text(json.dumps(m, separators=(",", ":")))
     return names
