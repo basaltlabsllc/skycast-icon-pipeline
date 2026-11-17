@@ -20,6 +20,20 @@
 export const YEAR_S = 365 * 24 * 3600;
 export const MULTIPART_BYTES = 32 * 1024 * 1024;
 
+// Files of FILE_PARTS_BYTES or more go up part by part, each 8 MiB part read
+// from the file at its own offset (bigfile.mjs), never read whole: node's
+// readFile refuses anything over 2 GiB, and ICON's column pack is 2.13 GiB
+// (run 2026-11-17T18Z). Not put() with a read stream: @vercel/blob 2.8.0 held
+// every part of a 2.3 GB stream in memory (2.2 GB of live buffers, measured
+// against a local stand-in for the API). Below the cut nothing changes: the
+// fog packs and every tile keep the whole-file put they have published with.
+export const FILE_PARTS_BYTES = 2 ** 30;
+
+/** True when a file of `size` bytes goes up part by part from disk (bigfile.mjs). */
+export function fromFileParts(size) {
+  return size >= FILE_PARTS_BYTES;
+}
+
 export function contentTypeFor(path) {
   return /(^|\/)pack(-[0-9a-f]+)?\/index\.json$/.test(path) ? 'application/json' : 'application/octet-stream';
 }

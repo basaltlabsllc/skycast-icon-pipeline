@@ -84,10 +84,12 @@ def pack_folder(root, rel, dest=None):
 
 
 # A pack is skipped (no key, the per-file copies stay) when it would be bigger
-# than node's readFile can hold (2 GiB; publish/blob.mjs reads each file whole)
-# or would leave the runner less than MIN_FREE_BYTES of disk: an ENOSPC in a
-# later step (publish state) fails the job, which a missing pack never does.
-MAX_PACK_BYTES = int(1.9 * 2**30)
+# than MAX_PACK_BYTES (a sanity cap: publish/blob.mjs streams files of 1 GiB or
+# more, so node's 2 GiB readFile limit no longer applies; ICON's column pack was
+# 2.13 GiB on 2026-11-17T18Z) or would leave the runner less than
+# MIN_FREE_BYTES of disk: an ENOSPC in a later step (publish state) fails the
+# job, which a missing pack never does.
+MAX_PACK_BYTES = 8 * 2**30
 MIN_FREE_BYTES = 3 * 10**9
 
 
@@ -102,7 +104,7 @@ def pack_skip_reason(root, rel, dest=None, free=None):
     """Why this folder must not be packed, or None."""
     size = folder_bytes(Path(root) / rel)
     if size > MAX_PACK_BYTES:
-        return f"{size / 2**30:.2f} GiB is over the {MAX_PACK_BYTES / 2**30:.1f} GiB a publish can read"
+        return f"{size / 2**30:.2f} GiB is over the {MAX_PACK_BYTES / 2**30:.1f} GiB pack cap"
     out = Path(dest if dest is not None else root)
     out.mkdir(parents=True, exist_ok=True)
     left = (shutil.disk_usage(out).free if free is None else free) - size

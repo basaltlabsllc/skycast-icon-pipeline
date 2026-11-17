@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { putOptionsFor, contentTypeFor, MULTIPART_BYTES, YEAR_S, packedOnlyFolders, splitPacked } from './upload.mjs';
+import { putOptionsFor, contentTypeFor, MULTIPART_BYTES, YEAR_S, packedOnlyFolders, splitPacked, fromFileParts, FILE_PARTS_BYTES } from './upload.mjs';
 
 // ---- Feed packs (PACK1, pipeline/pack.py) ------------------------------------
 // Pack folders are named by content: <kind>/<run>/pack-<12 hex of sha256(all.bin)>.
@@ -86,10 +86,20 @@ test('the pack index is JSON; packs, tiles and other files stay octet-stream', (
   assert.equal(contentTypeFor('places/20261101/index.json'), 'application/octet-stream');
 });
 
-test('blob.mjs uploads run-folder files through putOptionsFor with the body size', async () => {
+test('blob.mjs uploads run-folder files through putOptionsFor with the file size; 1 GiB and up part by part from disk', async () => {
   const { readFile } = await import('node:fs/promises');
   const src = await readFile(new URL('./blob.mjs', import.meta.url), 'utf8');
-  assert.match(src, /put\(path, body, putOptionsFor\(path, body\.length\)\)/);
+  assert.match(src, /const size = \(await stat\(full\)\)\.size;/);
+  assert.match(src, /put\(path, body, putOptionsFor\(path, size\)\)/);
+  assert.match(src, /if \(fromFileParts\(size\)\) \{/);
+  assert.match(src, /putFileParts\(createMultipartUploader, path, full, size, options,/);
+});
+
+test('the file-parts cut: below 1 GiB a whole-file put as before, at and above it part by part', () => {
+  assert.equal(fromFileParts(FILE_PARTS_BYTES - 1), false);
+  assert.equal(fromFileParts(FILE_PARTS_BYTES), true);
+  assert.equal(fromFileParts(110e6), false);           // the biggest fog pack
+  assert.equal(fromFileParts(2.29e9), true);           // ICON's column pack, 2026-11-17T18Z
 });
 
 test('Clear Night named only by its pack: its per-file copies are never uploaded', () => {
