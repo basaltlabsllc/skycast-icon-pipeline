@@ -178,3 +178,130 @@ def test_failed_step_cancels_queued_steps(small, tmp_path):
         gb.build(m, RUN, tmp_path, get, NOW, tmp_path / "state", sleep=lambda s: None)
     assert m.index_url(RUN, 1) in fetched
     assert len(fetched) < len(m.main_steps) // 2   # the queued steps never ran
+
+
+# --- Main hours the source never posted (GFS 2026-11-17 12Z f119) -----------
+
+import urllib.error
+
+
+def _missing(m, hours, code=404):
+    """A get that answers `code` for the .idx of each hour in `hours`."""
+    bad = {m.index_url(RUN, h) for h in hours}
+
+    def get(url, rng=None):
+        if url in bad:
+            raise urllib.error.HTTPError(url, code, "nope", {}, None)
+        return b""
+    return get
+
+
+def test_absent_hour_is_left_out_not_filled(small, tmp_path):
+    m = _small(GFS, range(0, 10), (12,))
+    gb.build(m, RUN, tmp_path, _missing(m, [7]), NOW, tmp_path / "state", sleep=lambda s: None)
+    man = json.loads((tmp_path / "manifest.json").read_text())
+    base = int(RUN.timestamp() // 3600)
+    present = [s for s in m.main_steps if s != 7]
+    assert man["stepsMs"] == [(base + s) * 3600 * 1000 for s in present]
+    assert man["absentStepsMs"] == [(base + 7) * 3600 * 1000]
+    assert man["complete"] is True
+    lat, lon = np.meshgrid(np.arange(-90, 90.25, 0.25), np.arange(-180, 180, 0.25), indexing="ij")
+    n = SQUARES[0]
+    sl, so = int(n[1:3]) * (1 if n[0] == "N" else -1), int(n[4:]) * (1 if n[3] == "E" else -1)
+    icl = decode_square((tmp_path / tiles_path(RUN) / f"{n}.icl").read_bytes())
+    icb = blocks.decode_blocks((tmp_path / blocks_path(RUN) / f"{n}.icb").read_bytes(), 4)
+    assert icl["step_hours"] == icb["step_hours"] == [base + s for s in present]
+    assert np.array_equal(icl["cube"], icb["cube"])
+    # Every stored step is the source's own hour: f006 and f008 sit side by
+    # side, nothing stands in for f007.
+    for i, s in enumerate(present):
+        want = quantize(slice_square(fake_cube(m, s, lat, lon), sl, so)[None], 2)[0]
+        assert np.array_equal(icl["cube"][i], want), s
+
+
+def test_no_absent_key_when_every_hour_is_posted(small, tmp_path):
+    m = _small(GFS, range(0, 8), (12,))
+    gb.build(m, RUN, tmp_path, _get, NOW, tmp_path / "state", sleep=lambda s: None)
+    assert "absentStepsMs" not in json.loads((tmp_path / "manifest.json").read_text())
+
+
+def test_two_adjacent_absent_hours_pass(small, tmp_path):
+    m = _small(GFS, range(0, 12), (12,))
+    gb.build(m, RUN, tmp_path, _missing(m, [8, 9]), NOW, tmp_path / "state", sleep=lambda s: None)
+    man = json.loads((tmp_path / "manifest.json").read_text())
+    base = int(RUN.timestamp() // 3600)
+    assert man["absentStepsMs"] == [(base + h) * 3600 * 1000 for h in (8, 9)]
+    assert len(man["stepsMs"]) == 10
+
+
+@pytest.mark.parametrize("code", [403, 500, 503])
+def test_other_http_errors_still_fail(small, tmp_path, code):
+    m = _small(GFS, range(0, 10), (12,))
+    with pytest.raises(urllib.error.HTTPError):
+        gb.build(m, RUN, tmp_path, _missing(m, [7], code), NOW, tmp_path / "state", sleep=lambda s: None)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("hours", [[0], [3], [9], [6, 7, 8]], ids=["first", "head", "last", "three"])
+def test_absent_hours_beyond_the_limits_fail(small, tmp_path, hours):
+    m = _small(GFS, range(0, 10), (12,))
+    with pytest.raises(gb.AbsentSteps):
+        gb.build(m, RUN, tmp_path, _missing(m, hours), NOW, tmp_path / "state", sleep=lambda s: None)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_absent_tail_hour_fails(small, tmp_path):
+    m = _small(GFS, range(0, 8), (9, 12))
+    with pytest.raises(urllib.error.HTTPError):
+        gb.build(m, RUN, tmp_path, _missing(m, [9]), NOW, tmp_path / "state", sleep=lambda s: None)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_absent_hour_retried_before_it_counts(small, tmp_path, monkeypatch):
+    m = _small(GFS, range(0, 10), (12,))
+    monkeypatch.setattr(gb, "build_thick", lambda *a, **k: None)   # count the cover's own reads
+    monkeypatch.setattr(gb, "build_wind", lambda *a, **k: None)
+    asked = []
+    inner = _missing(m, [7])
+
+    def get(url, rng=None):
+        asked.append(url)
+        return inner(url, rng)
+
+    gb.build(m, RUN, tmp_path, get, NOW, tmp_path / "state", sleep=lambda s: None)
+    assert asked.count(m.index_url(RUN, 7)) == gb.RETRIES + 1
+
+
+def test_six_hourly_feeds_never_skip():
+    steps = list(AIFS.main_steps)
+    assert gb._absent_problem(steps, [60], ()) is not None     # a 12 h hole
+    assert gb._absent_problem(list(range(0, 121)), [119], range(6)) is None
+    assert gb._absent_problem(list(range(0, 121)), [120], range(6)) is not None
+
+
+def test_thickness_reads_the_posted_hours_and_wind_its_own(small, tmp_path, monkeypatch):
+    m = _small(GFS, range(0, 10), (12,))
+    seen = {}
+
+    def thick(model, run, out_dir, get, sleep, names):
+        seen["thick"] = model.main_steps
+        return None
+
+    def wnd(model, run, out_dir, get, sleep, budget_s=0, clock=None):
+        seen["wind"] = model.main_steps
+        return None
+
+    monkeypatch.setattr(gb, "build_thick", thick)
+    monkeypatch.setattr(gb, "build_wind", wnd)
+    gb.build(m, RUN, tmp_path, _missing(m, [7]), NOW, tmp_path / "state", sleep=lambda s: None)
+    assert seen["thick"] == tuple(s for s in m.main_steps if s != 7)
+    assert seen["wind"] == m.main_steps
+
+
+def test_history_head_saved_with_a_later_hour_absent(small, tmp_path):
+    m = _small(GFS, range(0, 10), (12,))
+    state = tmp_path / "state"
+    gb.build(m, RUN, tmp_path, _missing(m, [7]), NOW, state, sleep=lambda s: None)
+    nxt = RUN + timedelta(hours=6)
+    found = history.load_history_steps(state, nxt, sub=m.name)
+    assert [h for h, _ in found] == [int(RUN.timestamp() // 3600) + s for s in range(6)]

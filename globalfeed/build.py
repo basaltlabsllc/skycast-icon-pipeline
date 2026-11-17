@@ -20,6 +20,11 @@
 #                          .pack). FEED_TILE_FILES=0 drops the per-file keys of
 #                          the packed folders. A failed pack drops its key only.
 #   manifest.json
+# A main hour the source never posted (a 404 for its file or its .idx; NOAA
+# never got GFS 2026-11-17 12Z f119) is left out of every step list above, so
+# the app blends its posted neighbours across the hole exactly as it blends any
+# time between two steps (and the 3-hourly tail); nothing is filled in. Only a
+# few such hours pass (_absent_problem); any other failure fails the build.
 # Memory follows hrrr/build.py: each worker reads one hour, puts it on the
 # feed's grid and cuts it straight into per-square uint8 [4][41][41] slices,
 # so only the small slices accumulate, never a stack of world arrays.
@@ -29,6 +34,7 @@ import dataclasses
 import json
 import shutil
 import time
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +55,39 @@ WIND_BUDGET_S = 600  # build_wind gives up after this long: the cover must still
 RETRIES = 2          # extra attempts per forecast hour
 QUANT_STEP = 2       # the same step the ICON Blob copy uses (run_build.QUANT_STEP)
 SYNOPTIC = (0, 6, 12, 18)
+MAX_ABSENT = 2       # main hours a build may go out without
+MAX_GAP_H = 3        # widest hole an absent hour may leave between posted hours: the tail's own spacing
+
+
+class AbsentSteps(Exception):
+    """Main hours the source never posted, more or other than a build may skip."""
+
+
+def _is_absent(e):
+    """A 404 alone says the source never posted the hour; anything else (403,
+    5xx, a timeout, a bad message) is a failure."""
+    return isinstance(e, urllib.error.HTTPError) and e.code == 404
+
+
+def _absent_problem(steps, absent, protected):
+    """Why the build may not go out without `absent` (a reason), or None.
+    `protected`: hours that must be read (the first, the last, the history head)."""
+    absent = sorted(absent)
+    if len(absent) > MAX_ABSENT:
+        return f"{len(absent)} hours absent (at most {MAX_ABSENT})"
+    if not steps:
+        return None
+    guard = set(protected) | {steps[0], steps[-1]}
+    hit = [s for s in absent if s in guard]
+    if hit:
+        return f"f{hit[0]:03d} is absent and must be read (first, last or history head step)"
+    present = [s for s in steps if s not in set(absent)]
+    for s in absent:
+        before = max(p for p in present if p < s)
+        after = min(p for p in present if p > s)
+        if after - before > MAX_GAP_H:
+            return f"f{s:03d} absent leaves a {after - before} h hole (at most {MAX_GAP_H} h)"
+    return None
 
 
 def newest_complete_run(model, exists, now):
@@ -84,21 +123,35 @@ def _cut(world, names):
     return {n: slice_square(world, *parse_name(n)) for n in names}
 
 
-def _hours(model, run, steps, get, sleep, names, keep=()):
-    """[{name: uint8 [4][41][41]}] per step, in order, read by a worker pool;
-    plus {step: world} for the steps listed in keep."""
+def _hours(model, run, steps, get, sleep, names, keep=(), may_skip=False):
+    """[{name: uint8 [4][41][41]}] per step read, in order, by a worker pool;
+    {step: world} for the steps listed in keep; and the steps absent (a 404
+    after the retries), only when may_skip and _absent_problem passes them
+    (keep is protected), else that 404 fails like any other error."""
     kept = {}
+    steps = list(steps)
 
     def one(fh):
-        world = _world(model, _read(model, run, fh, get, sleep))
+        try:
+            world = _world(model, _read(model, run, fh, get, sleep))
+        except Exception as e:
+            if may_skip and _is_absent(e):
+                return fh, None, None
+            raise
         return fh, _cut(world, names), (world if fh in keep else None)
 
-    out = []
+    out, absent = [], []
     ex = cf.ThreadPoolExecutor(max_workers=max(1, model.workers))
     try:
         futures = [ex.submit(one, fh) for fh in steps]
         for fut in futures:
             fh, cut, world = fut.result()
+            if cut is None:
+                absent.append(fh)
+                why = _absent_problem(steps, absent, keep)
+                if why:
+                    raise AbsentSteps(why)
+                continue
             out.append(cut)
             if world is not None:
                 kept[fh] = world
@@ -108,7 +161,7 @@ def _hours(model, run, steps, get, sleep, names, keep=()):
         ex.shutdown(wait=True, cancel_futures=True)
         raise
     ex.shutdown(wait=True)
-    return out, kept
+    return out, kept, tuple(absent)
 
 
 def _write(out_dir, rel, names, hours, per_hour, suffix, encode):
@@ -240,7 +293,8 @@ def build_wind(model, run, out_dir, get, sleep, budget_s=WIND_BUDGET_S, clock=ti
 def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, clock=time.monotonic):
     """Write the run into out_dir; returns the square names. A step that still
     fails after its retries raises: a build is all or nothing (thickness
-    excepted: see build_thick). steps limits the forecast hours (a sample run:
+    excepted: see build_thick; and a few main hours the source never posted,
+    left out of the steps: see _absent_problem). steps limits the forecast hours (a sample run:
     no tail, the manifest says complete: false, the history head is not saved)."""
     started = clock()
     tile_files = pack.tile_files_on()     # FEED_TILE_FILES, read once per build
@@ -256,8 +310,14 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
     head_steps = (list(range(history.HEAD_STEPS)) if gfs_like
                   else list(range(0, model.run_spacing, 6)))
     keep = tuple(s for s in head_steps if s in model.main_steps)
-    own, kept = _hours(model, run, model.main_steps, get, sleep, names, keep=keep)
-    own_hours = [base + s for s in model.main_steps]
+    own, kept, absent = _hours(model, run, model.main_steps, get, sleep, names, keep=keep, may_skip=True)
+    if absent:
+        print(f"::warning::{model.name} {run_id(run)}: never posted (404), left out of the steps: "
+              + ", ".join(f"f{s:03d}" for s in absent))
+    # Thickness follows the cover's steps; wind keeps its own (a missing hour
+    # drops wind for the run, see build_wind).
+    read_model = dataclasses.replace(model, main_steps=tuple(s for s in model.main_steps if s not in absent))
+    own_hours = [base + s for s in read_model.main_steps]
 
     # History first (unreadable history costs the past, never the run).
     past, past_hours = [], []
@@ -297,13 +357,13 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
     tail = None
     if model.tail_steps:
         tail_hours = [base + s for s in model.tail_steps]
-        tail_cut, _ = _hours(model, run, model.tail_steps, get, sleep, names)
+        tail_cut, _, _ = _hours(model, run, model.tail_steps, get, sleep, names)
         _write(out_dir, tail_path(run), names, tail_hours, tail_cut, ".icl", encode_square)
         tail = {"run": run_iso(run), "runMs": int(run.timestamp() * 1000),
                 "stepsMs": [h * 3600 * 1000 for h in tail_hours], "tiles": tail_path(run)}
         packs["tail"] = pack.try_pack(out_dir, tail_path(run))
 
-    thickness = build_thick(model, run, out_dir, get, sleep, names)
+    thickness = build_thick(read_model, run, out_dir, get, sleep, names)
     if thickness:
         packs["thick"] = pack.try_pack(out_dir, thick_path(run))
     # The whole build runs under the workflow's timeout: wind gets what is left
@@ -329,6 +389,11 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, cl
         m.pop(k, None)
     if wind_entry:
         m["wind"] = wind_entry
+    # The main hours the source never posted (unix ms), for whoever reads the
+    # manifest by hand; absent when none. The app does not read it: stepsMs
+    # already leaves them out.
+    if absent:
+        m["absentStepsMs"] = [(base + s) * 3600 * 1000 for s in absent]
     m["model"] = model.name
     m["attribution"] = model.attribution
     m = pack.add_pack_keys(m, packs, tile_files=tile_files)
