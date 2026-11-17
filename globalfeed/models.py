@@ -105,6 +105,7 @@ AIFS = Model(
     workers=4,  # ECMWF's open-data server limits parallel connections
     _url="https://data.ecmwf.int/forecasts/{d}/{h:02d}z/aifs-single/0p25/oper/{d}{h:02d}0000-{f}h-oper-fc.grib2",
     _index_ext=(".grib2", ".index"),
+    wind=True,
 )
 
 
@@ -126,4 +127,5 @@ IFS = Model(
     thick_fields=(("tciw", "ice"), ("tclw", "water")),
     run_hours=(0, 12),
     check_cover_units=True,
+    wind=True,
 )
