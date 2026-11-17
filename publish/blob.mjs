@@ -31,7 +31,7 @@ import { createRetry, paceDelay, filesToSend } from './pace.mjs';
 import { pruneOldRuns, DELETES_PER_SEC } from './sweep.mjs';
 import { listAll as listStore, readManifest } from './store.mjs';
 import { stampManifest } from './stamp.mjs';
-import { putOptionsFor } from './upload.mjs';
+import { putOptionsFor, splitPacked } from './upload.mjs';
 
 const MANIFEST_S = 60;            // Blob's shortest cache time
 const CONCURRENCY = 16;           // Pro allows 75 uploads/s; leave room for retries
@@ -80,11 +80,15 @@ async function main() {
   const before = await listAll();
   const previous = await readManifest(before);
 
+  // FEED_TILE_FILES=0 (pipeline/pack.py): a folder the manifest names only by
+  // its pack goes up as the pack alone (upload.mjs splitPacked).
+  const packed = splitPacked(files, current);
+  if (packed.skipped) console.log(`${packed.skipped} per-file copies of packed folders not uploaded (tile files off)`);
   const t0 = Date.now();
   const bytesByDir = Object.fromEntries(dirs.map((d) => [d, 0]));
   const countByDir = Object.fromEntries(dirs.map((d) => [d, 0]));
-  const send = filesToSend(files, before.map((b) => b.pathname), process.env.BLOB_SKIP_EXISTING === '1');
-  if (send.length !== files.length) console.log(`resuming: ${files.length - send.length} files already in the store`);
+  const send = filesToSend(packed.send, before.map((b) => b.pathname), process.env.BLOB_SKIP_EXISTING === '1');
+  if (send.length !== packed.send.length) console.log(`resuming: ${packed.send.length - send.length} files already in the store`);
   await pool(send, CONCURRENCY, async ({ path, dir }, k) => {
     const wait = paceDelay(k, PER_SEC, t0, Date.now());
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));

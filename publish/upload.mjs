@@ -32,3 +32,45 @@ export function putOptionsFor(path, size) {
   if (size >= MULTIPART_BYTES) o.multipart = true;
   return o;
 }
+
+// ---- Feed packs (PACK1, pipeline/pack.py: ICON, GFS, AIFS, IFS) -------------
+//
+// Every per-square folder <kind>/<run>/ also carries <kind>/<run>/pack/
+// (all.bin + index.json; above: the year cache, multipart from the cut, the
+// index as JSON). The builds' FEED_TILE_FILES switch decides whether the Blob
+// manifest still names the per-file folder: "1" names both (both layouts go
+// up), "0" names only the pack. The manifest is the one source of truth here:
+// a folder the manifest reaches only through its pack has its per-file copies
+// left out of the upload, so no blob is ever written that no manifest names. A
+// pack that failed leaves no pack key and the per-file key in place, so its
+// files still go up. The HRRR fog entry has its own switch and is not touched.
+
+const TOP_PACKS = [['tiles', 'tilesPack'], ['blocks', 'blocksPack']];
+const ENTRY_PACKS = ['tail', 'thick', 'columns', 'wind'];
+const slash = (p) => p.replace(/\/?$/, '/');
+
+/** [[runFolder/, runFolder/pack/]] for each folder the manifest names only by its pack. */
+export function packedOnlyFolders(m) {
+  const out = [];
+  if (!m) return out;
+  const add = (pack) => {
+    const p = slash(pack);
+    out.push([p.replace(/pack\/$/, ''), p]);
+  };
+  for (const [k, pk] of TOP_PACKS) {
+    if (typeof m[pk] === 'string' && m[pk] && !(typeof m[k] === 'string' && m[k])) add(m[pk]);
+  }
+  for (const k of ENTRY_PACKS) {
+    const e = m[k];
+    if (e && typeof e.pack === 'string' && e.pack && !(typeof e.tiles === 'string' && e.tiles)) add(e.pack);
+  }
+  return out;
+}
+
+/** files ([{ path, dir }]) without the per-file copies of packed-only folders: { send, skipped }. */
+export function splitPacked(files, m) {
+  const folders = packedOnlyFolders(m);
+  if (!folders.length) return { send: files, skipped: 0 };
+  const send = files.filter(({ path }) => !folders.some(([run, pack]) => path.startsWith(run) && !path.startsWith(pack)));
+  return { send, skipped: files.length - send.length };
+}

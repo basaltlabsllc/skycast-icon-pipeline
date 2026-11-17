@@ -171,3 +171,42 @@ test('fog packs: the backlog cleanup reads a pack-only fog run', () => {
   const paths = ['fog/2026111012/pack/0.iccp', 'fog/2026111011/pack/0.iccp', 'fog/2026111010/pack/0.iccp'];
   assert.deepEqual(backlogToDelete(paths, live), ['fog/2026111010/pack/0.iccp']);
 });
+
+// Feed packs (PACK1, pipeline/pack.py): ICON, GFS, AIFS, IFS. With
+// FEED_TILE_FILES=0 a manifest names a folder only by its pack.
+const packOnly = (R, T = R) => ({
+  tilesPack: `tiles/${R}/pack`, blocksPack: `blocks/${R}/pack`, tail: { pack: `tail/${T}/pack` },
+  thick: { pack: `thick/${R}/pack` }, columns: { pack: `columns/${R}/pack` }, wind: { pack: `wind/${R}/pack` },
+});
+
+test('feed packs: a pack-only manifest keeps every pack folder, wind included', () => {
+  assert.deepEqual(manifestFolders(packOnly('B')), [
+    'tiles/B/pack/', 'blocks/B/pack/', 'tail/B/pack/', 'columns/B/pack/', 'thick/B/pack/', 'wind/B/pack/',
+  ]);
+  const paths = ['manifest.json', 'tiles/B/pack/all.bin', 'tiles/B/pack/index.json', 'wind/B/pack/all.bin',
+    'tiles/A/pack/all.bin', 'blocks/A/pack/index.json', 'tiles/Z/pack/all.bin', 'wind/Z/pack/all.bin', 'tail/Z/N40W125.icl'];
+  assert.deepEqual(pathsToDelete(paths, { current: packOnly('B'), previous: packOnly('A') }),
+    ['tiles/Z/pack/all.bin', 'wind/Z/pack/all.bin', 'tail/Z/N40W125.icl']);
+});
+
+test('feed packs: with tile files on, the whole run folder is kept, files and pack', () => {
+  const m = { tiles: 'tiles/B', tilesPack: 'tiles/B/pack', blocks: 'blocks/B', blocksPack: 'blocks/B/pack',
+    wind: { tiles: 'wind/B', pack: 'wind/B/pack' } };
+  assert.deepEqual(manifestFolders(m), ['tiles/B/', 'blocks/B/', 'wind/B/', 'tiles/B/pack/', 'blocks/B/pack/', 'wind/B/pack/']);
+  const paths = ['tiles/B/N40W125.icl', 'tiles/B/pack/all.bin', 'wind/B/N30W120.icw', 'wind/B/pack/index.json', 'tiles/A/pack/all.bin'];
+  assert.deepEqual(pathsToDelete(paths, { current: m, previous: null }), ['tiles/A/pack/all.bin']);
+});
+
+test('feed packs: the backlog cleanup reads a pack-only manifest (no tiles key) without refusing', () => {
+  const paths = ['tiles/2026111012/pack/all.bin', 'tiles/2026111006/pack/all.bin', 'tiles/2026111000/pack/all.bin',
+    'wind/2026111012/pack/all.bin', 'wind/2026111000/N30W120.icw'];
+  // wind's newest older run is kept (the previous manifest's), the one before that goes.
+  assert.deepEqual(backlogToDelete([...paths, 'wind/2026110918/x.icw'], packOnly('2026111012')),
+    ['tiles/2026111000/pack/all.bin', 'wind/2026110918/x.icw']);
+});
+
+test('feed packs: run history keeps a kept run\'s packs (tiles and thick folders)', () => {
+  const cur = { ...packOnly('2026111619'), runMs: Date.UTC(2026, 10, 16, 19) };
+  const paths = ['tiles/2026111618/pack/all.bin', 'thick/2026111618/pack/index.json', 'tiles/2026111500/pack/all.bin'];
+  assert.deepEqual(pathsToDelete(paths, { current: cur, previous: null, keepHours: 2 }), ['tiles/2026111500/pack/all.bin']);
+});
