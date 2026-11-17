@@ -140,3 +140,39 @@ def test_build_wind_over_budget_drops_key(monkeypatch, tmp_path, capsys):
     assert "::warning::wind: over budget" in capsys.readouterr().out
     now[0] = 0.0
     assert gb.build_wind(_small(GFS, (0,)), RUN, tmp_path, get, lambda s: None, budget_s=600, clock=lambda: now[0])
+
+
+def _timed_build(monkeypatch, tmp_path, started_at, elapsed):
+    """build() with a fake clock that jumps `elapsed` s during thickness; returns build_wind's budgets."""
+    seen = []
+    cur = [started_at]
+    names = [square_name(40, -125)]
+    monkeypatch.setattr(gb, "all_squares", lambda: list(names))
+    monkeypatch.setattr(gb, "build_wind", lambda *a, **k: seen.append(k.get("budget_s")))
+
+    def fake_read(model, run, fh, get):
+        lat, lon = np.meshgrid(np.arange(-90, 90.25, 0.25), np.arange(-180, 180, 0.25), indexing="ij")
+        out = {"lat": lat.ravel(), "lon": lon.ravel()}
+        for f in model.fields:
+            out[f if isinstance(f, str) else f[0]] = np.full(lat.size, 40.0)
+        return out
+
+    def thick_then_jump(*a, **k):
+        cur[0] = started_at + elapsed
+
+    monkeypatch.setattr(gb, "read_step", fake_read)
+    monkeypatch.setattr(gb, "build_thick", thick_then_jump)
+    gb.build(_small(GFS, (0, 6)), RUN, tmp_path, lambda u, r=None: b"", NOW, tmp_path / "st",
+             sleep=lambda s: None, clock=lambda: cur[0])
+    return seen
+
+
+def test_wind_budget_shrinks_with_a_late_start(monkeypatch, tmp_path):
+    assert _timed_build(monkeypatch, tmp_path / "a", 1000.0, 0.0) == [600]
+    assert _timed_build(monkeypatch, tmp_path / "b", 1000.0, 2200.0) == [380]   # 2700 - 2200 - 120
+
+
+def test_wind_skipped_when_no_time_left(monkeypatch, tmp_path, capsys):
+    assert _timed_build(monkeypatch, tmp_path, 5.0, 2600.0) == []              # 2700 - 2600 - 120 < 0
+    assert "::warning::wind: no time left, skipped" in capsys.readouterr().out
+    assert "wind" not in json.loads((tmp_path / "manifest.json").read_text())

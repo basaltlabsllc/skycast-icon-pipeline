@@ -38,6 +38,8 @@ from . import history6
 from .grib import read_step, read_thick_step, read_wind_step
 from .latlon import to_feed, to_feed_float
 
+WORKFLOW_TIMEOUT_S = 2700  # must match `timeout -k 10 2700` in .github/workflows/{gfs,aifs,ifs}.yml
+WIND_MARGIN_S = 120        # kept free after wind for the manifest write and publish
 WIND_BUDGET_S = 600  # build_wind gives up after this long: the cover must still go out inside the workflow timeout
 RETRIES = 2          # extra attempts per forecast hour
 QUANT_STEP = 2       # the same step the ICON Blob copy uses (run_build.QUANT_STEP)
@@ -230,11 +232,12 @@ def build_wind(model, run, out_dir, get, sleep, budget_s=WIND_BUDGET_S, clock=ti
     return wind.manifest_entry(run)
 
 
-def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None):
+def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, clock=time.monotonic):
     """Write the run into out_dir; returns the square names. A step that still
     fails after its retries raises: a build is all or nothing (thickness
     excepted: see build_thick). steps limits the forecast hours (a sample run:
     no tail, the manifest says complete: false, the history head is not saved)."""
+    started = clock()
     if steps is not None:
         model = dataclasses.replace(model, main_steps=tuple(sorted(set(int(s) for s in steps))), tail_steps=())
     names = all_squares()
@@ -289,7 +292,14 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None):
                 "stepsMs": [h * 3600 * 1000 for h in tail_hours], "tiles": tail_path(run)}
 
     thickness = build_thick(model, run, out_dir, get, sleep, names)
-    wind_entry = build_wind(model, run, out_dir, get, sleep)
+    # The whole build runs under the workflow's timeout: wind gets what is left
+    # of it minus a margin, so a slow cover can never lose the manifest to wind.
+    wind_budget = min(WIND_BUDGET_S, WORKFLOW_TIMEOUT_S - (clock() - started) - WIND_MARGIN_S)
+    if model.wind and wind_budget <= 0:
+        print("::warning::wind: no time left, skipped")
+        wind_entry = None
+    else:
+        wind_entry = build_wind(model, run, out_dir, get, sleep, budget_s=wind_budget)
     try:
         hist_runs = published.history_runs(state, run)
         hist_since = published.since(state)
