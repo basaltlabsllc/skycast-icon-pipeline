@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 
 from pipeline import pack
 
@@ -10,6 +12,10 @@ def _read(root, pack_rel, name):
     return (root / pack_rel / "all.bin").read_bytes()[start:idx["ends"][i]]
 
 
+def _packs(d):
+    return sorted(p.name for p in d.iterdir() if p.is_dir())
+
+
 def test_offsets_round_trip_every_file_byte_exact(tmp_path):
     d = tmp_path / "tiles" / "2026111700"
     d.mkdir(parents=True)
@@ -18,41 +24,60 @@ def test_offsets_round_trip_every_file_byte_exact(tmp_path):
     for n, b in files.items():
         (d / n).write_bytes(b)
     rel = pack.pack_folder(tmp_path, "tiles/2026111700")
-    assert rel == "tiles/2026111700/pack"
-    idx = json.loads((d / "pack" / "index.json").read_text())
+    assert re.fullmatch(r"tiles/2026111700/pack-[0-9a-f]{12}", rel)
+    idx = json.loads((tmp_path / rel / "index.json").read_text())
     assert idx["format"] == "PACK1"
     assert idx["names"] == sorted(files)
-    assert idx["ends"][-1] == (d / "pack" / "all.bin").stat().st_size == sum(map(len, files.values()))
+    data = (tmp_path / rel / "all.bin").read_bytes()
+    assert idx["ends"][-1] == len(data) == sum(map(len, files.values()))
     for n, b in files.items():
         assert _read(tmp_path, rel, n) == b
+    # The folder is named by its content: the first 12 hex digits of sha256(all.bin).
+    assert rel.endswith("/pack-" + hashlib.sha256(data).hexdigest()[:12])
+    assert _packs(d) == [rel.rsplit("/", 1)[1]]              # no build folder left behind
+
+
+def test_same_content_same_folder_different_content_different_folder(tmp_path):
+    for root in ("a", "b", "c"):
+        (tmp_path / root / "tiles" / "R").mkdir(parents=True)
+        (tmp_path / root / "tiles" / "R" / "x.icl").write_bytes(b"cover")
+    (tmp_path / "c" / "tiles" / "R" / "x.icl").write_bytes(b"cover, repaired")
+    a, b, c = (pack.pack_folder(tmp_path / r, "tiles/R") for r in ("a", "b", "c"))
+    assert a == b                     # same bytes, same folder, wherever it is built
+    assert a != c                     # a repair that changes a byte gets a new folder
+    # Packed again in place: the same folder, still one pack.
+    assert pack.pack_folder(tmp_path / "a", "tiles/R") == a
+    assert _packs(tmp_path / "a" / "tiles" / "R") == [a.rsplit("/", 1)[1]]
 
 
 def test_empty_or_missing_folder_gives_none_and_writes_nothing(tmp_path):
     assert pack.pack_folder(tmp_path, "tiles/none") is None
     (tmp_path / "blocks" / "R").mkdir(parents=True)
     assert pack.pack_folder(tmp_path, "blocks/R") is None
-    assert not (tmp_path / "blocks" / "R" / "pack").exists()
+    assert _packs(tmp_path / "blocks" / "R") == []
 
 
 def test_a_pack_is_never_packed_into_itself(tmp_path):
     d = tmp_path / "thick" / "R"
     d.mkdir(parents=True)
     (d / "a.ict").write_bytes(b"one")
-    pack.pack_folder(tmp_path, "thick/R")
+    first = pack.pack_folder(tmp_path, "thick/R")
     (d / "b.ict").write_bytes(b"two")
-    pack.pack_folder(tmp_path, "thick/R")          # again, with pack/ already there
-    idx = json.loads((d / "pack" / "index.json").read_text())
+    second = pack.pack_folder(tmp_path, "thick/R")          # again, with a pack already there
+    idx = json.loads((tmp_path / second / "index.json").read_text())
     assert idx["names"] == ["a.ict", "b.ict"]
-    assert (d / "pack" / "all.bin").read_bytes() == b"onetwo"
+    assert (tmp_path / second / "all.bin").read_bytes() == b"onetwo"
+    assert first != second and (tmp_path / first / "all.bin").read_bytes() == b"one"   # untouched
 
 
 def test_dest_writes_the_pack_under_another_root_at_the_same_path(tmp_path):
     site, blob = tmp_path / "site", tmp_path / "blob"
     (site / "tiles" / "R").mkdir(parents=True)
     (site / "tiles" / "R" / "x.icl").write_bytes(b"xyz")
-    assert pack.pack_folder(site, "tiles/R", dest=blob) == "tiles/R/pack"
-    assert not (site / "tiles" / "R" / "pack").exists()
-    assert (blob / "tiles" / "R" / "pack" / "all.bin").read_bytes() == b"xyz"
+    rel = pack.pack_folder(site, "tiles/R", dest=blob)
+    assert re.fullmatch(r"tiles/R/pack-[0-9a-f]{12}", rel)
+    assert _packs(site / "tiles" / "R") == []
+    assert (blob / rel / "all.bin").read_bytes() == b"xyz"
 
 
 def test_tile_files_switch_only_zero_is_off(capsys):
@@ -68,16 +93,21 @@ def test_tile_files_switch_only_zero_is_off(capsys):
 def test_try_pack_logs_its_size_and_a_failure_is_a_warning_not_an_exception(tmp_path, capsys, monkeypatch):
     (tmp_path / "tiles" / "R").mkdir(parents=True)
     (tmp_path / "tiles" / "R" / "a.icl").write_bytes(b"12345")
-    assert pack.try_pack(tmp_path, "tiles/R") == "tiles/R/pack"
-    out = capsys.readouterr().out
-    assert "pack tiles/R/pack: 1 files" in out
+    got = pack.try_pack(tmp_path, "tiles/R")
+    assert re.fullmatch(r"tiles/R/pack-[0-9a-f]{12}", got)
+    assert f"pack {got}: 1 files" in capsys.readouterr().out
+
+    # A failure half way (all.bin written, the index not): a warning, no key,
+    # and the half-built pack removed, so nothing of it is uploaded.
+    (tmp_path / "tiles" / "R" / "b.icl").write_bytes(b"678")
 
     def boom(*a, **k):
         raise OSError("disk full")
-    monkeypatch.setattr(pack, "pack_folder", boom)
+    monkeypatch.setattr(pack.json, "dumps", boom)
     assert pack.try_pack(tmp_path, "tiles/R") is None
+    monkeypatch.undo()
     assert "::warning::pack tiles/R failed: OSError: disk full" in capsys.readouterr().out
-    assert not (tmp_path / "tiles" / "R" / "pack").exists()   # the partial pack is removed
+    assert _packs(tmp_path / "tiles" / "R") == [got.rsplit("/", 1)[1]]   # only the earlier, whole pack
 
 
 def test_add_pack_keys_on_keeps_every_per_file_key():

@@ -3,47 +3,52 @@ import assert from 'node:assert/strict';
 import { putOptionsFor, contentTypeFor, MULTIPART_BYTES, YEAR_S, packedOnlyFolders, splitPacked } from './upload.mjs';
 
 // ---- Feed packs (PACK1, pipeline/pack.py) ------------------------------------
+// Pack folders are named by content: <kind>/<run>/pack-<12 hex of sha256(all.bin)>.
+const H = 'pack-0123456789ab';
+const H2 = 'pack-fedcba987654';
 
 test('every feed pack all.bin gets the year cache as octet-stream (multipart from the cut); its index is JSON', () => {
   for (const k of ['tiles', 'blocks', 'tail', 'thick', 'columns', 'wind']) {
-    const bin = putOptionsFor(`${k}/2026111700/pack/all.bin`, 400e6);
+    const bin = putOptionsFor(`${k}/2026111700/${H}/all.bin`, 400e6);
     assert.equal(bin.cacheControlMaxAge, YEAR_S);
     assert.equal(bin.contentType, 'application/octet-stream');
     assert.equal(bin.multipart, true);
-    assert.equal('multipart' in putOptionsFor(`${k}/2026111700/pack/all.bin`, 2e6), false);
-    const idx = putOptionsFor(`${k}/2026111700/pack/index.json`, 3e5);
+    assert.equal('multipart' in putOptionsFor(`${k}/2026111700/${H}/all.bin`, 2e6), false);
+    const idx = putOptionsFor(`${k}/2026111700/${H}/index.json`, 3e5);
     assert.equal(idx.cacheControlMaxAge, YEAR_S);
     assert.equal(idx.contentType, 'application/json');
   }
+  // Only a pack folder's index is JSON, not a lookalike.
+  assert.equal(contentTypeFor('tiles/2026111700/packing/index.json'), 'application/octet-stream');
 });
 
 test('tile files on: every folder is still named per file, nothing is skipped', () => {
-  const m = { tiles: 'tiles/R', tilesPack: 'tiles/R/pack', blocks: 'blocks/R', blocksPack: 'blocks/R/pack',
-    tail: { tiles: 'tail/T', pack: 'tail/T/pack' }, wind: { tiles: 'wind/R', pack: 'wind/R/pack' } };
+  const m = { tiles: 'tiles/R', tilesPack: `tiles/R/${H}`, blocks: 'blocks/R', blocksPack: `blocks/R/${H}`,
+    tail: { tiles: 'tail/T', pack: `tail/T/${H}` }, wind: { tiles: 'wind/R', pack: `wind/R/${H}` } };
   assert.deepEqual(packedOnlyFolders(m), []);
-  const files = [{ path: 'tiles/R/a.icl', dir: 's' }, { path: 'tiles/R/pack/all.bin', dir: 'b' }];
+  const files = [{ path: 'tiles/R/a.icl', dir: 's' }, { path: `tiles/R/${H}/all.bin`, dir: 'b' }];
   assert.deepEqual(splitPacked(files, m), { send: files, skipped: 0 });
 });
 
 test('tile files off: the per-file copies of every packed folder are skipped, the packs and the rest go up', () => {
-  const m = { tilesPack: 'tiles/R/pack', blocksPack: 'blocks/R/pack', tail: { pack: 'tail/T/pack' },
-    thick: { pack: 'thick/R/pack' }, columns: { pack: 'columns/R/pack' }, wind: { pack: 'wind/R/pack' },
+  const m = { tilesPack: `tiles/R/${H}`, blocksPack: `blocks/R/${H2}`, tail: { pack: `tail/T/${H}` },
+    thick: { pack: `thick/R/${H}` }, columns: { pack: `columns/R/${H}` }, wind: { pack: `wind/R/${H}` },
     fog: { pack: 'fog/R/pack' } };
   assert.deepEqual(packedOnlyFolders(m), [
-    ['tiles/R/', 'tiles/R/pack/'], ['blocks/R/', 'blocks/R/pack/'], ['tail/T/', 'tail/T/pack/'],
-    ['thick/R/', 'thick/R/pack/'], ['columns/R/', 'columns/R/pack/'], ['wind/R/', 'wind/R/pack/'],
+    ['tiles/R/', `tiles/R/${H}/`], ['blocks/R/', `blocks/R/${H2}/`], ['tail/T/', `tail/T/${H}/`],
+    ['thick/R/', `thick/R/${H}/`], ['columns/R/', `columns/R/${H}/`], ['wind/R/', `wind/R/${H}/`],
   ]);   // fog is HRRR's own switch (FOG_TILE_FILES): never touched here
-  const paths = ['tiles/R/a.icl', 'tiles/R/pack/all.bin', 'tiles/R/pack/index.json', 'blocks/R/a.icb',
-    'blocks/R/pack/all.bin', 'tail/T/a.icl', 'thick/R/a.ict', 'columns/R/a.icc', 'wind/R/N30W120.icw',
-    'wind/R/pack/all.bin', 'tiles/RX/a.icl', 'runs/2026111700.json', 'fog/R/N44W122/0.icc'];
+  const paths = ['tiles/R/a.icl', `tiles/R/${H}/all.bin`, `tiles/R/${H}/index.json`, 'blocks/R/a.icb',
+    `blocks/R/${H2}/all.bin`, 'tail/T/a.icl', 'thick/R/a.ict', 'columns/R/a.icc', 'wind/R/N30W120.icw',
+    `wind/R/${H}/all.bin`, 'tiles/RX/a.icl', 'runs/2026111700.json', 'fog/R/N44W122/0.icc'];
   const { send, skipped } = splitPacked(paths.map((path) => ({ path, dir: 'd' })), m);
   assert.equal(skipped, 6);
-  assert.deepEqual(send.map((f) => f.path), ['tiles/R/pack/all.bin', 'tiles/R/pack/index.json',
-    'blocks/R/pack/all.bin', 'wind/R/pack/all.bin', 'tiles/RX/a.icl', 'runs/2026111700.json', 'fog/R/N44W122/0.icc']);
+  assert.deepEqual(send.map((f) => f.path), [`tiles/R/${H}/all.bin`, `tiles/R/${H}/index.json`,
+    `blocks/R/${H2}/all.bin`, `wind/R/${H}/all.bin`, 'tiles/RX/a.icl', 'runs/2026111700.json', 'fog/R/N44W122/0.icc']);
 });
 
 test('tile files off with a failed pack: that folder has no pack key, keeps its per-file key and its files go up', () => {
-  const m = { tilesPack: 'tiles/R/pack', blocks: 'blocks/R' };
+  const m = { tilesPack: `tiles/R/${H}`, blocks: 'blocks/R' };
   const { send, skipped } = splitPacked([{ path: 'blocks/R/a.icb', dir: 'b' }, { path: 'tiles/R/a.icl', dir: 's' }], m);
   assert.deepEqual(send.map((f) => f.path), ['blocks/R/a.icb']);
   assert.equal(skipped, 1);

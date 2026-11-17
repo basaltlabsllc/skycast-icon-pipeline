@@ -174,39 +174,56 @@ test('fog packs: the backlog cleanup reads a pack-only fog run', () => {
 
 // Feed packs (PACK1, pipeline/pack.py): ICON, GFS, AIFS, IFS. With
 // FEED_TILE_FILES=0 a manifest names a folder only by its pack.
-const packOnly = (R, T = R) => ({
-  tilesPack: `tiles/${R}/pack`, blocksPack: `blocks/${R}/pack`, tail: { pack: `tail/${T}/pack` },
-  thick: { pack: `thick/${R}/pack` }, columns: { pack: `columns/${R}/pack` }, wind: { pack: `wind/${R}/pack` },
+// Pack folders are named by content: <kind>/<run>/pack-<12 hex of sha256(all.bin)>.
+const P = 'pack-0123456789ab';
+const OLD = 'pack-fedcba987654';   // the same run's pack before an ICON repair rebuilt it
+const packOnly = (R, T = R, h = P) => ({
+  tilesPack: `tiles/${R}/${h}`, blocksPack: `blocks/${R}/${h}`, tail: { pack: `tail/${T}/${h}` },
+  thick: { pack: `thick/${R}/${h}` }, columns: { pack: `columns/${R}/${h}` }, wind: { pack: `wind/${R}/${h}` },
 });
 
 test('feed packs: a pack-only manifest keeps every pack folder, wind included', () => {
   assert.deepEqual(manifestFolders(packOnly('B')), [
-    'tiles/B/pack/', 'blocks/B/pack/', 'tail/B/pack/', 'columns/B/pack/', 'thick/B/pack/', 'wind/B/pack/',
+    `tiles/B/${P}/`, `blocks/B/${P}/`, `tail/B/${P}/`, `columns/B/${P}/`, `thick/B/${P}/`, `wind/B/${P}/`,
   ]);
-  const paths = ['manifest.json', 'tiles/B/pack/all.bin', 'tiles/B/pack/index.json', 'wind/B/pack/all.bin',
-    'tiles/A/pack/all.bin', 'blocks/A/pack/index.json', 'tiles/Z/pack/all.bin', 'wind/Z/pack/all.bin', 'tail/Z/N40W125.icl'];
+  const paths = ['manifest.json', `tiles/B/${P}/all.bin`, `tiles/B/${P}/index.json`, `wind/B/${P}/all.bin`,
+    `tiles/A/${P}/all.bin`, `blocks/A/${P}/index.json`, `tiles/Z/${P}/all.bin`, `wind/Z/${P}/all.bin`, 'tail/Z/N40W125.icl'];
   assert.deepEqual(pathsToDelete(paths, { current: packOnly('B'), previous: packOnly('A') }),
-    ['tiles/Z/pack/all.bin', 'wind/Z/pack/all.bin', 'tail/Z/N40W125.icl']);
+    [`tiles/Z/${P}/all.bin`, `wind/Z/${P}/all.bin`, 'tail/Z/N40W125.icl']);
 });
 
 test('feed packs: with tile files on, the whole run folder is kept, files and pack', () => {
-  const m = { tiles: 'tiles/B', tilesPack: 'tiles/B/pack', blocks: 'blocks/B', blocksPack: 'blocks/B/pack',
-    wind: { tiles: 'wind/B', pack: 'wind/B/pack' } };
-  assert.deepEqual(manifestFolders(m), ['tiles/B/', 'blocks/B/', 'wind/B/', 'tiles/B/pack/', 'blocks/B/pack/', 'wind/B/pack/']);
-  const paths = ['tiles/B/N40W125.icl', 'tiles/B/pack/all.bin', 'wind/B/N30W120.icw', 'wind/B/pack/index.json', 'tiles/A/pack/all.bin'];
-  assert.deepEqual(pathsToDelete(paths, { current: m, previous: null }), ['tiles/A/pack/all.bin']);
+  const m = { tiles: 'tiles/B', tilesPack: `tiles/B/${P}`, blocks: 'blocks/B', blocksPack: `blocks/B/${P}`,
+    wind: { tiles: 'wind/B', pack: `wind/B/${P}` } };
+  assert.deepEqual(manifestFolders(m), ['tiles/B/', 'blocks/B/', 'wind/B/', `tiles/B/${P}/`, `blocks/B/${P}/`, `wind/B/${P}/`]);
+  const paths = ['tiles/B/N40W125.icl', `tiles/B/${P}/all.bin`, 'wind/B/N30W120.icw', `wind/B/${P}/index.json`, `tiles/A/${P}/all.bin`];
+  assert.deepEqual(pathsToDelete(paths, { current: m, previous: null }), [`tiles/A/${P}/all.bin`]);
+});
+
+test('feed packs: an older pack-<hash> of a repaired run is harmless and goes with the run', () => {
+  const old = [`tiles/B/${OLD}/all.bin`, `tiles/B/${OLD}/index.json`];
+  const now = [`tiles/B/${P}/all.bin`, `tiles/B/${P}/index.json`];
+  // Files on: the run folder is named, so the old pack stays while the run does.
+  const on = { tiles: 'tiles/B', tilesPack: `tiles/B/${P}` };
+  assert.deepEqual(pathsToDelete([...old, ...now, 'tiles/B/N40W125.icl'], { current: on, previous: null }), []);
+  // Files off: kept while the previous manifest (the run before the repair) names it, deleted after.
+  assert.deepEqual(pathsToDelete([...old, ...now], { current: packOnly('B'), previous: packOnly('B', 'B', OLD) }), []);
+  assert.deepEqual(pathsToDelete([...old, ...now], { current: packOnly('B'), previous: packOnly('A') }), old);
+  // The backlog cleanup works by run: the current run's old pack stays, a dropped run's packs all go.
+  assert.deepEqual(backlogToDelete([...old, ...now, `tiles/0/${OLD}/all.bin`, `tiles/0/${P}/all.bin`,
+    `tiles/1/${P}/all.bin`], packOnly('B')), [`tiles/0/${OLD}/all.bin`, `tiles/0/${P}/all.bin`]);
 });
 
 test('feed packs: the backlog cleanup reads a pack-only manifest (no tiles key) without refusing', () => {
-  const paths = ['tiles/2026111012/pack/all.bin', 'tiles/2026111006/pack/all.bin', 'tiles/2026111000/pack/all.bin',
-    'wind/2026111012/pack/all.bin', 'wind/2026111000/N30W120.icw'];
+  const paths = [`tiles/2026111012/${P}/all.bin`, `tiles/2026111006/${P}/all.bin`, `tiles/2026111000/${P}/all.bin`,
+    `wind/2026111012/${P}/all.bin`, 'wind/2026111000/N30W120.icw'];
   // wind's newest older run is kept (the previous manifest's), the one before that goes.
   assert.deepEqual(backlogToDelete([...paths, 'wind/2026110918/x.icw'], packOnly('2026111012')),
-    ['tiles/2026111000/pack/all.bin', 'wind/2026110918/x.icw']);
+    [`tiles/2026111000/${P}/all.bin`, 'wind/2026110918/x.icw']);
 });
 
 test('feed packs: run history keeps a kept run\'s packs (tiles and thick folders)', () => {
   const cur = { ...packOnly('2026111619'), runMs: Date.UTC(2026, 10, 16, 19) };
-  const paths = ['tiles/2026111618/pack/all.bin', 'thick/2026111618/pack/index.json', 'tiles/2026111500/pack/all.bin'];
-  assert.deepEqual(pathsToDelete(paths, { current: cur, previous: null, keepHours: 2 }), ['tiles/2026111500/pack/all.bin']);
+  const paths = [`tiles/2026111618/${P}/all.bin`, `thick/2026111618/${P}/index.json`, `tiles/2026111500/${P}/all.bin`];
+  assert.deepEqual(pathsToDelete(paths, { current: cur, previous: null, keepHours: 2 }), [`tiles/2026111500/${P}/all.bin`]);
 });

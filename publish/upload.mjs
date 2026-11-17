@@ -11,7 +11,8 @@
 // operations each, ~100 a run against the ~6,500 tile files it replaces), and
 // every other feed file is far below it.
 //
-// Content type: a pack index (fog/<run>/pack/index.json) is application/json;
+// Content type: a pack index (fog/<run>/pack/index.json, and the feed packs'
+// <kind>/<run>/pack-<h>/index.json below) is application/json;
 // everything else stays application/octet-stream as before (places' index.json
 // included: unchanged here). All run-folder files keep the year cache: their
 // paths change with every run, and a pack index never changes within one.
@@ -20,7 +21,7 @@ export const YEAR_S = 365 * 24 * 3600;
 export const MULTIPART_BYTES = 32 * 1024 * 1024;
 
 export function contentTypeFor(path) {
-  return /(^|\/)pack\/index\.json$/.test(path) ? 'application/json' : 'application/octet-stream';
+  return /(^|\/)pack(-[0-9a-f]+)?\/index\.json$/.test(path) ? 'application/json' : 'application/octet-stream';
 }
 
 /** put() options for a run-folder file of `size` bytes. */
@@ -35,9 +36,12 @@ export function putOptionsFor(path, size) {
 
 // ---- Feed packs (PACK1, pipeline/pack.py: ICON, GFS, AIFS, IFS) -------------
 //
-// Every per-square folder <kind>/<run>/ also carries <kind>/<run>/pack/
-// (all.bin + index.json; above: the year cache, multipart from the cut, the
-// index as JSON). The builds' FEED_TILE_FILES switch decides whether the Blob
+// Every per-square folder <kind>/<run>/ also carries <kind>/<run>/pack-<h>/,
+// <h> the first 12 hex digits of sha256(all.bin), the exact folder the
+// manifest key names (all.bin + index.json; above: the year cache, multipart
+// from the cut, the index as JSON). A rebuilt run (an ICON repair) with other
+// bytes gets another folder, so a year-cached all.bin never changes under an
+// index. The builds' FEED_TILE_FILES switch decides whether the Blob
 // manifest still names the per-file folder: "1" names both (both layouts go
 // up), "0" names only the pack. The manifest is the one source of truth here:
 // a folder the manifest reaches only through its pack has its per-file copies
@@ -55,7 +59,7 @@ export function packedOnlyFolders(m) {
   if (!m) return out;
   const add = (pack) => {
     const p = slash(pack);
-    out.push([p.replace(/pack\/$/, ''), p]);
+    out.push([p.replace(/[^/]+\/$/, ''), p]);     // the run folder: the pack folder's parent
   };
   for (const [k, pk] of TOP_PACKS) {
     if (typeof m[pk] === 'string' && m[pk] && !(typeof m[k] === 'string' && m[k])) add(m[pk]);

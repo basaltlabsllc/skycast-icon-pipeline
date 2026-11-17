@@ -1,10 +1,11 @@
 # PACK1 packs (pipeline/pack.py) for the global models: GFS, AIFS and IFS (IFS
 # gets every change even while its schedule is paused). Every per-square folder
-# (tiles, blocks, tail, thick, and GFS's wind) gets <folder>/pack/, and the
+# (tiles, blocks, tail, thick, and GFS's wind) gets <folder>/pack-<hash>/, and the
 # manifest names it beside the per-file key; FEED_TILE_FILES=0 drops the
 # per-file keys of the packed kinds.
 import dataclasses
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,6 +66,11 @@ def _build(model, out):
     return json.loads((out / "manifest.json").read_text())
 
 
+def _is_pack(path, folder):
+    """folder/pack-<first 12 hex of sha256(all.bin)>."""
+    return re.fullmatch(re.escape(folder) + r"/pack-[0-9a-f]{12}", path or "") is not None
+
+
 def _pack_matches(root, folder, pack_rel):
     idx = json.loads((root / pack_rel / "index.json").read_text())
     data = (root / pack_rel / "all.bin").read_bytes()
@@ -101,9 +107,10 @@ def test_every_folder_gets_a_byte_exact_pack_and_both_keys(small, tmp_path, monk
     for kind in KINDS[model.name]:
         folder = f"{kind}/{R}"
         assert _per_file(man, kind) == folder, kind
-        assert _pack_key(man, kind) == f"{folder}/pack", kind
-        _pack_matches(out, folder, f"{folder}/pack")
-        assert f"pack {folder}/pack: " in logged                  # each pack's size is logged
+        key = _pack_key(man, kind)
+        assert _is_pack(key, folder), (kind, key)
+        _pack_matches(out, folder, key)
+        assert f"pack {key}: " in logged                          # each pack's size is logged
     for kind in {"tiles", "blocks", "tail", "thick", "wind"} - set(KINDS[model.name]):
         assert _pack_key(man, kind) is None and not (out / kind).exists()
 
@@ -116,8 +123,8 @@ def test_tile_files_off_names_only_the_packs(small, tmp_path, monkeypatch, model
     assert "tile files off" in capsys.readouterr().out
     for kind in KINDS[model.name]:
         assert _per_file(man, kind) is None, kind
-        assert _pack_key(man, kind) == f"{kind}/{R}/pack", kind
-        assert (out / kind / R / "pack" / "all.bin").is_file()
+        assert _is_pack(_pack_key(man, kind), f"{kind}/{R}"), kind
+        assert (out / _pack_key(man, kind) / "all.bin").is_file()
     # The rest of the manifest is untouched.
     assert man["run"] == "2026-11-08T00Z" and man["model"] == model.name and man["squares"] == sorted(SQUARES)
 
@@ -135,5 +142,27 @@ def test_a_failed_pack_drops_its_key_never_the_build(small, tmp_path, monkeypatc
     man = _build(GFS, out)
     assert "::warning::pack wind/2026110800 failed" in capsys.readouterr().out
     assert man["wind"]["tiles"] == f"wind/{R}" and "pack" not in man["wind"]   # still named per file
-    assert man["tilesPack"] == f"tiles/{R}/pack" and "tiles" not in man
-    assert not (out / "wind" / R / "pack").exists()
+    assert _is_pack(man["tilesPack"], f"tiles/{R}") and "tiles" not in man
+    assert not any(p.is_dir() for p in (out / "wind" / R).iterdir())
+
+
+@pytest.mark.parametrize("model", [GFS, AIFS, IFS], ids=lambda m: m.name)
+def test_pack_folders_are_named_by_content(small, tmp_path, monkeypatch, model):
+    # The same run built twice from the same data: the same folders. A rebuild
+    # of the run with different cover: new folders, in the same run folder.
+    monkeypatch.setenv("FEED_TILE_FILES", "1")
+    a = _build(model, tmp_path / "a")
+    b = _build(model, tmp_path / "b")
+    for kind in KINDS[model.name]:
+        assert _pack_key(a, kind) == _pack_key(b, kind), kind
+    # Changed cover: every cover folder gets a new pack folder.
+    real = gb.read_step
+
+    def brighter(m, run, fh, get):
+        d = real(m, run, fh, get)
+        return {k: (v if k in ("lat", "lon") else (v + 13) % 101) for k, v in d.items()}
+    monkeypatch.setattr(gb, "read_step", brighter)
+    c = _build(model, tmp_path / "c")
+    for kind in ("tiles", "blocks", "tail"):
+        assert _pack_key(a, kind) != _pack_key(c, kind), kind
+        assert _per_file(a, kind) == _per_file(c, kind)
