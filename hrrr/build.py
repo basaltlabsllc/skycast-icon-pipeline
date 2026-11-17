@@ -34,6 +34,8 @@ from .grib import FIELDS, file_url, read_fields, read_thick, read_wind
 from .grid import SQUARES, bin_index, box_average, box_mean
 
 RETRIES = 2          # extra attempts per forecast hour
+WORKFLOW_TIMEOUT_S = 1200  # must match `timeout -k 10 1200` on hrrr_build.py in .github/workflows/hrrr.yml
+WIND_MARGIN_S = 120        # kept free after wind for the manifest write and publish
 WIND_BUDGET_S = 600  # build_wind gives up after this long: the cover must still go out inside the workflow timeout
 ATTRIBUTION = "Cloud data: NOAA HRRR"
 
@@ -174,12 +176,13 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
     return wind.manifest_entry(run)
 
 
-def build(run, out_dir, get, now, sleep=time.sleep, fhs=None):
+def build(run, out_dir, get, now, sleep=time.sleep, fhs=None, clock=time.monotonic):
     """Write out_dir/tiles/<YYYYMMDDHH>/<name>.icl for every SQUARES entry,
     out_dir/thick/... when thickness could be read, and out_dir/manifest.json.
     Returns the square names. Any cover hour that still fails after its retries
     raises: a build is all or nothing. fhs limits the forecast hours (a sample
     run); such a manifest says complete: false."""
+    started = clock()
     out_dir = Path(out_dir)
     last = last_hour(run)
     fhs = list(range(last + 1)) if fhs is None else sorted(set(int(f) for f in fhs))
@@ -209,7 +212,14 @@ def build(run, out_dir, get, now, sleep=time.sleep, fhs=None):
         (tiles / f"{name}.icl").write_bytes(encode_square(sl, so, hours, cube))
         names.append(name)
     thickness = build_thick(run, out_dir, get, sleep, fhs, bins, workers)
-    wind_entry = build_wind(run, out_dir, get, sleep, fhs, workers)
+    # The whole build runs under the workflow's timeout: wind gets what is left
+    # of it minus a margin, so a slow cover can never lose the manifest to wind.
+    wind_budget = min(WIND_BUDGET_S, WORKFLOW_TIMEOUT_S - (clock() - started) - WIND_MARGIN_S)
+    if wind_budget <= 0:
+        print("::warning::wind: no time left, skipped")
+        wind_entry = None
+    else:
+        wind_entry = build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=wind_budget)
     m = json.loads(build_manifest(run, now, hours, names, 0, complete=fhs == list(range(last + 1)),
                                   thick=thickness))
     m["model"] = "hrrr"

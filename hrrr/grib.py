@@ -176,14 +176,19 @@ def wind_ranges(sfc_idx, fh):
     return out
 
 
+def _turn(lon, lov_deg, latin1_deg):
+    """(cos a, sin a) of the grid's turn at each lon: a = sin(Latin1) x (lon - LoV)."""
+    dlon = (np.asarray(lon, dtype=np.float64) - lov_deg + 180.0) % 360.0 - 180.0
+    a = np.sin(np.radians(latin1_deg)) * np.radians(dlon)
+    return np.cos(a), np.sin(a)
+
+
 def rotate_to_earth(u, v, lon, lov_deg, latin1_deg):
     """Grid-relative (u, v) on a Lambert conformal grid -> east/north (ue, ve).
     The grid's x axis lies a = sin(Latin1) x (lon - LoV) counter-clockwise of
     east, so ue = cos a u + sin a v and ve = -sin a u + cos a v. lon and LoV in
     degrees east, either -180..180 or 0..360."""
-    dlon = (np.asarray(lon, dtype=np.float64) - lov_deg + 180.0) % 360.0 - 180.0
-    a = np.sin(np.radians(latin1_deg)) * np.radians(dlon)
-    c, s = np.cos(a), np.sin(a)
+    c, s = _turn(lon, lov_deg, latin1_deg)
     u = np.asarray(u, dtype=np.float64)
     v = np.asarray(v, dtype=np.float64)
     return c * u + s * v, -s * u + c * v
@@ -227,9 +232,10 @@ def read_wind(run, fh, get):
         finally:
             eccodes.codes_release(g)
         raw[key] = np.where(np.isclose(vals, miss), np.nan, vals)
+    c, s = _turn(out["lon"], rot[0], rot[1]) if rot is not None else (None, None)
     for lev in WIND_LEVELS:
         u, v = raw.pop((lev, "u")), raw.pop((lev, "v"))
         if rot is not None:
-            u, v = rotate_to_earth(u, v, out["lon"], rot[0], rot[1])
+            u, v = c * u + s * v, -s * u + c * v
         out[(lev, "u")], out[(lev, "v")] = u, v
     return out

@@ -129,3 +129,50 @@ def test_build_wind_writes_groups_and_entry(tmp_path):
     assert got["step_hours"] == [base, base + 1]
     # node (41, -110) holds 3, -4 at every level
     assert got["cube"][0, 0, 0, 11, 10] == 3 and got["cube"][1, 2, 1, 11, 10] == -4
+
+
+def test_read_wind_rotates_with_lov_then_latin1(monkeypatch):
+    f = _wind_files(0, val=lambda lev, comp: 10.0 if comp == "u" else 0.0)
+    # the fixture's cells sit at -110/-109; put LoV west of them so they are east of it
+    monkeypatch.setattr(hg, "_wind_geometry", lambda g: (
+        np.array([41.0, 41.0, 40.0, 40.0]), np.array([-80.0, -80.0, -80.0, -80.0]), (262.5, 38.5)))
+    d = hg.read_wind(RUN, 0, f.get)
+    a = np.sin(np.radians(38.5)) * np.radians(17.5)
+    assert (d[(250, "v")] < 0).all()
+    assert np.allclose(d[(250, "u")], 10 * np.cos(a), atol=1e-4) and np.allclose(d[(250, "v")], -10 * np.sin(a), atol=1e-4)
+    assert np.allclose(np.hypot(d[(850, "u")], d[(850, "v")]), 10.0, atol=1e-4)
+
+
+def _slow_build(monkeypatch, tmp_path, started_at):
+    """Run build() with a fake clock that jumps ELAPSED seconds during thickness."""
+    seen = []
+    cur = [started_at]
+    monkeypatch.setattr(hb, "last_hour", lambda run: 1)
+    monkeypatch.setattr(hb, "build_wind", lambda *a, **k: seen.append(k.get("budget_s")))
+    lat, lon = np.meshgrid(np.arange(30.0, 50.0, 0.1), np.arange(-120.0, -100.0, 0.1), indexing="ij")
+    monkeypatch.setattr(hb, "read_fields", lambda run, fh, get: {
+        "lat": lat.ravel(), "lon": lon.ravel(), **{n: np.full(lat.size, 40.0) for n, _ in hb.FIELDS}})
+
+    def thick_then_jump(*a, **k):
+        cur[0] = started_at + ELAPSED[0]
+
+    monkeypatch.setattr(hb, "build_thick", thick_then_jump)
+    hb.build(RUN, tmp_path, lambda u, r=None: b"", NOW, sleep=lambda s: None, clock=lambda: cur[0])
+    return seen
+
+
+ELAPSED = [0.0]
+
+
+def test_wind_budget_shrinks_with_a_late_start(monkeypatch, tmp_path):
+    ELAPSED[0] = 0.0
+    assert _slow_build(monkeypatch, tmp_path / "a", 1000.0) == [600]
+    ELAPSED[0] = 800.0     # 1200 - 800 - 120 = 280
+    assert _slow_build(monkeypatch, tmp_path / "b", 1000.0) == [280]
+
+
+def test_wind_skipped_when_no_time_left(monkeypatch, tmp_path, capsys):
+    ELAPSED[0] = 1100.0    # 1200 - 1100 - 120 < 0
+    assert _slow_build(monkeypatch, tmp_path, 5.0) == []
+    assert "::warning::wind: no time left, skipped" in capsys.readouterr().out
+    assert "wind" not in json.loads((tmp_path / "manifest.json").read_text())
