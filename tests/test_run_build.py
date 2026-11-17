@@ -90,7 +90,7 @@ def test_clear_night_goes_to_blob_as_one_pack_and_the_blob_manifest_names_only_i
     rc, site, blob = _clear_build(tmp_path)
     assert rc == run_build.BUILT
     cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
-    assert cn["format"] == "CLN1" and cn["keys"] == ["N30W140"] and cn["nights"]
+    assert cn["format"] == "CLN2" and cn["keys"] == ["N30W140"] and cn["nights"]
     assert "tiles" not in cn
     assert cn["pack"].startswith("clearnight/2026092700/pack-")
     # Two Blob puts a run: the pack and its index; the per-file tiles are gone.

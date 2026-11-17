@@ -298,7 +298,7 @@ def site_manifest(run, built, hours, names, history_steps, complete, tail=None, 
 
 def build_clear_night(blob_dir, run, names, stacks):
     """SkyCast's Clear Night map (pipeline/clearnight.py): each night's total
-    cover over its astronomically dark hours, as 20° CLN1 tiles under
+    cover over its astronomically dark hours, as 20° CLN2 tiles under
     clearnight/<run>/ on Blob, from the same hours as the squares (history
     first). Returns the manifest's `clearNight` entry, or None; a failure here
     never fails the build — the map then has no Clear Night until the next run."""

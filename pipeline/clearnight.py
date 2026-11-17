@@ -14,12 +14,18 @@
 # sample, makes the node no data for that night: a night half covered would
 # read as a better or worse night than the model said.
 #
-# CLN1, one file per 20° tile per night: a 12-byte header (magic, swLat, swLon,
-# side, layers, clearMax), the night as 10 ASCII bytes, then a zlib stream of
-# u8 [4][161][161], south row first, west column first, edges included like
-# the 5° squares'. Layers: mean cover %, cloudiest hour %, clear hours (cover
-# ≤ CLEAR_MAX), dark hours. 255 is no data; dark hours 0 marks a night with no
-# astronomical darkness (the other three are 255 there).
+# CLN2, one file per 20° tile per night: a 16-byte header (magic, swLat, swLon,
+# side, layers, clearMax, anchor), the night as 10 ASCII bytes, then a zlib
+# stream of u8 [8][161][161], south row first, west column first, edges
+# included like the 5° squares'. Layers 0-3: mean cover %, cloudiest hour %,
+# clear hours (cover ≤ CLEAR_MAX), dark hours. 255 is no data; dark hours 0
+# marks a night with no astronomical darkness (the other three are 255 there).
+# Layers 4-7: WHICH dark hours are clear, a 32-bit mask little-endian across
+# the four (layer 4 the low byte): bit j set = the UTC hour anchor + j (unix
+# hours, int32 in the header: the tile's earliest window hour) is dark and
+# clear by the same CLEAR_MAX. 0 where the node has no data. CLN1 (12-byte
+# header, the first four layers only) is what was published before
+# 2026-11-18; decode_tile still reads it (anchor None).
 import datetime as dt
 import struct
 import zlib
@@ -28,14 +34,18 @@ import numpy as np
 
 from .squares import DEG, NX, NY
 
-MAGIC = b"CLN1"
+MAGIC = b"CLN2"
+FORMAT = "CLN2"
 TILE_DEG = 20
 TILE_SIDE = TILE_DEG * 8 + 1      # 161
-LAYERS = 4
+STAT_LAYERS = 4
+MASK_BYTES = 4                    # 32 hours from the anchor; a tile's windows span < 27
+LAYERS = STAT_LAYERS + MASK_BYTES
 CLEAR_MAX = 20                    # a dark hour with total cover at or under this is clear
 DARK_ALT_DEG = -18.0
 MISSING = 255
-_HEADER = struct.Struct("<4shhHBB")
+_HEADER = struct.Struct("<4shhHBBi")
+_HEADER_V1 = struct.Struct("<4shhHBB")
 
 
 def sun_altitude_deg(lat, lon, unix_hour):
@@ -62,6 +72,21 @@ def _night_base_hour(night):
 def night_stats(cover_at, hours, lats, lons, night):
     """u8 [4][R][C] for night `night`: cover_at u8 [len(hours)][R][C] total
     cover, hours ascending unix hours, lats [R], lons [C] in degrees."""
+    return night_layers(cover_at, hours, lats, lons, night)[0][:STAT_LAYERS]
+
+
+def clear_hours(layers, anchor, r, c):
+    """The unix hours marked dark and clear at node (r, c) of night_layers' output."""
+    m = 0
+    for b in range(MASK_BYTES):
+        m |= int(layers[STAT_LAYERS + b][r][c]) << (8 * b)
+    return [anchor + j for j in range(8 * MASK_BYTES) if m >> j & 1]
+
+
+def night_layers(cover_at, hours, lats, lons, night):
+    """(u8 [LAYERS][R][C], anchor): night_stats' four layers plus the clear-hour
+    mask (see the header comment), anchor the first whole hour of the
+    earliest window among the columns."""
     cover_at = np.asarray(cover_at)
     hours = np.asarray(hours, dtype=np.int64)
     lats = np.asarray(lats, dtype=np.float64)
@@ -75,6 +100,9 @@ def night_stats(cover_at, hours, lats, lons, night):
     clear = np.zeros((R, C), np.int16)
     dark = np.zeros((R, C), np.int16)
     missing = np.zeros((R, C), bool)
+    mask = np.zeros((R, C), np.uint32)
+    if h1 - h0 >= 8 * MASK_BYTES:
+        raise ValueError(f"windows span {h1 - h0} h, more than the {8 * MASK_BYTES}-hour mask")
     la, lo = np.meshgrid(lats, lons, indexing="ij")
     for h in range(h0, h1 + 1):
         inwin = (h >= start) & (h < start + 24.0)
@@ -101,7 +129,9 @@ def night_stats(cover_at, hours, lats, lons, night):
         total[ok] += cov[ok]
         r = np.rint(cov).astype(np.int16)
         worst[ok] = np.maximum(worst[ok], r[ok])
-        clear[ok] += (cov[ok] <= CLEAR_MAX)
+        is_clear = ok & (cov <= CLEAR_MAX)
+        clear[is_clear] += 1
+        mask[is_clear] |= np.uint32(1 << (h - h0))
         dark[d] += 1
     out = np.full((LAYERS, R, C), MISSING, np.uint8)
     has = (dark > 0) & ~missing
@@ -109,7 +139,10 @@ def night_stats(cover_at, hours, lats, lons, night):
     out[1][has] = worst[has]
     out[2][has] = clear[has]
     out[3][~missing] = dark[~missing]
-    return out
+    mask[~has] = 0
+    for b in range(MASK_BYTES):
+        out[STAT_LAYERS + b] = (mask >> (8 * b)) & 0xFF
+    return out, h0
 
 
 def tile_name(sw_lat, sw_lon):
@@ -159,26 +192,31 @@ def tile_axes(sw_lat, sw_lon):
     return sw_lat + i, sw_lon + i
 
 
-def encode_tile(sw_lat, sw_lon, night, layers):
+def encode_tile(sw_lat, sw_lon, night, layers, anchor):
     layers = np.asarray(layers, dtype=np.uint8)
     if layers.shape != (LAYERS, TILE_SIDE, TILE_SIDE):
         raise ValueError(f"layers must be [{LAYERS}][{TILE_SIDE}][{TILE_SIDE}], got {layers.shape}")
     nb = night.encode("ascii")
     if len(nb) != 10:
         raise ValueError(f"bad night {night!r}")
-    head = _HEADER.pack(MAGIC, int(sw_lat), int(sw_lon), TILE_SIDE, LAYERS, CLEAR_MAX)
+    head = _HEADER.pack(MAGIC, int(sw_lat), int(sw_lon), TILE_SIDE, LAYERS, CLEAR_MAX, int(anchor))
     return head + nb + zlib.compress(layers.tobytes(), 9)
 
 
 def decode_tile(blob):
-    magic, sw_lat, sw_lon, side, n, clear_max = _HEADER.unpack_from(blob, 0)
-    if magic != MAGIC:
-        raise ValueError("not a CLN1 file")
-    off = _HEADER.size
+    """A CLN2 tile, or a CLN1 one (anchor None, four layers)."""
+    if blob[:4] == MAGIC:
+        magic, sw_lat, sw_lon, side, n, clear_max, anchor = _HEADER.unpack_from(blob, 0)
+        off = _HEADER.size
+    elif blob[:4] == b"CLN1":
+        magic, sw_lat, sw_lon, side, n, clear_max = _HEADER_V1.unpack_from(blob, 0)
+        anchor, off = None, _HEADER_V1.size
+    else:
+        raise ValueError("not a CLN1 or CLN2 file")
     night = blob[off:off + 10].decode("ascii")
     body = zlib.decompress(blob[off + 10:])
     return {"sw_lat": sw_lat, "sw_lon": sw_lon, "side": side, "night": night, "clear_max": clear_max,
-            "layers": np.frombuffer(body, np.uint8).reshape(n, side, side)}
+            "anchor": anchor, "layers": np.frombuffer(body, np.uint8).reshape(n, side, side)}
 
 
 def nights_for(hours):
@@ -226,9 +264,9 @@ def build_clearnight(out_dir, run_id, hours, cover_world, keys=None, first_night
         for k in keys:
             la, lo = _parse(k)
             lats, lons = tile_axes(la, lo)
-            layers = night_stats(cubes[k], hours, lats, lons, night)
+            layers, anchor = night_layers(cubes[k], hours, lats, lons, night)
             any_data |= bool((layers[0] != MISSING).any())
-            files[k] = encode_tile(la, lo, night, layers)
+            files[k] = encode_tile(la, lo, night, layers, anchor)
         if not any_data:
             continue
         root.mkdir(parents=True, exist_ok=True)
@@ -238,5 +276,5 @@ def build_clearnight(out_dir, run_id, hours, cover_world, keys=None, first_night
         sizes[night] = sum(len(b) for b in files.values())
     if not nights:
         return None
-    return {"format": "CLN1", "tiles": path(run_id), "nights": nights, "deg": TILE_DEG, "side": TILE_SIDE,
+    return {"format": FORMAT, "tiles": path(run_id), "nights": nights, "deg": TILE_DEG, "side": TILE_SIDE,
             "clearMax": CLEAR_MAX, "darkAltDeg": DARK_ALT_DEG, "keys": keys, "bytes": sizes}

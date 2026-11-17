@@ -3,7 +3,8 @@ import datetime as dt
 import numpy as np
 import pytest
 from pipeline.clearnight import (sun_altitude_deg, night_stats, tile_keys, tile_name, slice_tile, encode_tile,
-                                 decode_tile, nights_for, build_clearnight, TILE_SIDE, CLEAR_MAX, MISSING)
+                                 decode_tile, nights_for, build_clearnight, TILE_SIDE, CLEAR_MAX, MISSING,
+                                 night_layers, clear_hours, LAYERS, MASK_BYTES)
 from pipeline.squares import NX, NY
 
 BEND = (44.058, -121.315)
@@ -38,6 +39,48 @@ def test_night_stats_counts_dark_hours_and_clear():
     assert clear == 4                       # 03, 04, 05, 06Z
     assert mx == 90
     assert mean == round((4 * 10 + 7 * 90) / 11)
+
+
+def one_node_hours(hours, cover_of):
+    cov = np.array([[[cover_of(h)]] for h in hours], dtype=np.uint8)
+    layers, anchor = night_layers(cov, hours, np.array([BEND[0]]), np.array([BEND[1]]), "2026-11-17")
+    return layers, anchor
+
+
+def test_night_layers_mark_which_dark_hours_are_clear():
+    # The same night as above: dark 03Z..13Z, clear (cover <= CLEAR_MAX) at 03, 04, 05, 06Z and 10Z.
+    six, ten = int(uh(2026, 11, 18, 6)), int(uh(2026, 11, 18, 10))
+    layers, anchor = one_node_hours(bend_hours(), lambda h: 10 if h <= six or h == ten else 90)
+    assert layers.shape == (LAYERS, 1, 1) and LAYERS == 4 + MASK_BYTES
+    assert clear_hours(layers, anchor, 0, 0) == [int(uh(2026, 11, 18, k)) for k in (3, 4, 5, 6, 10)]
+    # The first four layers are night_stats' exactly.
+    assert list(layers[:4, 0, 0]) == list(one_node(bend_hours(), lambda h: 10 if h <= six or h == ten else 90))
+
+
+def test_night_layers_threshold_is_clear_max_and_only_dark_hours_count():
+    # Cover exactly CLEAR_MAX is clear, one more is not; daylight hours are never marked, however clear.
+    seven = int(uh(2026, 11, 18, 7))
+    layers, anchor = one_node_hours(bend_hours(), lambda h: CLEAR_MAX if h == seven else (0 if h < int(uh(2026, 11, 18, 2)) else CLEAR_MAX + 1))
+    assert clear_hours(layers, anchor, 0, 0) == [seven]
+
+
+def test_night_layers_no_mask_where_no_data():
+    seven = int(uh(2026, 11, 18, 7))
+    layers, anchor = one_node_hours(bend_hours(), lambda h: MISSING if h == seven else 0)
+    assert clear_hours(layers, anchor, 0, 0) == []
+    assert list(layers[:4, 0, 0]) == [MISSING] * 4
+
+
+def test_night_layers_anchor_covers_a_whole_tile():
+    # A tile's 161 columns span 20 deg of longitude: every window hour fits in the 32-bit mask.
+    hours = list(range(int(uh(2026, 11, 17, 0)), int(uh(2026, 11, 19, 12))))
+    lats, lons = np.array([44.0, 49.9]), np.linspace(-140, -120, TILE_SIDE)
+    cov = np.zeros((len(hours), 2, TILE_SIDE), dtype=np.uint8)
+    layers, anchor = night_layers(cov, hours, lats, lons, "2026-11-17")
+    for c in (0, TILE_SIDE // 2, TILE_SIDE - 1):
+        hs = clear_hours(layers, anchor, 0, c)
+        assert hs and len(hs) == int(layers[3, 0, c])       # all clear: every dark hour is listed
+        assert all(anchor <= h < anchor + 8 * MASK_BYTES for h in hs)
 
 
 def test_night_stats_no_data_when_hours_missing():
@@ -101,11 +144,20 @@ def test_tiles_for_squares_are_the_covering_20_degree_tiles():
 
 
 def test_tile_roundtrip():
-    layers = np.random.default_rng(1).integers(0, 256, (4, TILE_SIDE, TILE_SIDE), dtype=np.uint8)
-    blob = encode_tile(40, -140, "2026-11-17", layers)
+    layers = np.random.default_rng(1).integers(0, 256, (LAYERS, TILE_SIDE, TILE_SIDE), dtype=np.uint8)
+    blob = encode_tile(40, -140, "2026-11-17", layers, anchor=493000)
+    assert blob[:4] == b"CLN2"
     d = decode_tile(blob)
-    assert (d["sw_lat"], d["sw_lon"], d["night"], d["clear_max"]) == (40, -140, "2026-11-17", CLEAR_MAX)
+    assert (d["sw_lat"], d["sw_lon"], d["night"], d["clear_max"], d["anchor"]) == (40, -140, "2026-11-17", CLEAR_MAX, 493000)
     assert np.array_equal(d["layers"], layers)
+
+
+def test_decode_tile_still_reads_cln1():
+    import struct, zlib
+    layers = np.random.default_rng(2).integers(0, 256, (4, TILE_SIDE, TILE_SIDE), dtype=np.uint8)
+    blob = struct.pack("<4shhHBB", b"CLN1", 40, -140, TILE_SIDE, 4, CLEAR_MAX) + b"2026-11-17" + zlib.compress(layers.tobytes())
+    d = decode_tile(blob)
+    assert d["anchor"] is None and np.array_equal(d["layers"], layers)
 
 
 def test_nights_for_spans_the_hours():
@@ -117,7 +169,7 @@ def test_build_clearnight_writes_listed_nights(tmp_path):
     hours = list(range(int(uh(2026, 11, 17, 12)), int(uh(2026, 11, 19, 0)) + 1))
     world = np.full((NY, NX), 30, dtype=np.uint8)
     entry = build_clearnight(tmp_path, "2026111712", hours, lambda i: world)
-    assert entry["format"] == "CLN1" and entry["tiles"] == "clearnight/2026111712"
+    assert entry["format"] == "CLN2" and entry["tiles"] == "clearnight/2026111712"
     assert "2026-11-17" in entry["nights"]
     # Flat, <night>_<key>.cln, so pipeline/pack.py (which packs the files
     # directly in a folder) puts every night in the one pack.
@@ -126,6 +178,7 @@ def test_build_clearnight_writes_listed_nights(tmp_path):
     f = run_dir / "2026-11-17_N30W140.cln"
     d = decode_tile(f.read_bytes())
     # Bend sits at row (44.058-30)/0.125 ≈ 112, col (−121.315+140)/0.125 ≈ 149.
-    mean, mx, clear, dark = d["layers"][:, 112, 149]
+    mean, mx, clear, dark = d["layers"][:4, 112, 149]
     assert (mean, mx, clear) == (30, 30, 0) and dark >= 10
+    assert clear_hours(d["layers"], d["anchor"], 112, 149) == []      # 30 % is never clear
     assert entry["bytes"]["2026-11-17"] > 0
