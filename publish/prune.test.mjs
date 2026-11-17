@@ -39,6 +39,10 @@ test('the column feed folder is kept like the tail; a null or old-style manifest
   assert.deepEqual(pathsToDelete(paths, { current: cur, previous: prev }), paths);
 });
 
+test('the wind folder is kept like the others', () => {
+  assert.deepEqual(manifestFolders({ wind: { tiles: 'wind/2026111700' } }), ['wind/2026111700/']);
+});
+
 test('the blocks and thickness folders are kept like the others; a manifest without them has none', () => {
   const m = { tiles: 'tiles/A', blocks: 'blocks/A', thick: { tiles: 'thick/A' }, tail: null, columns: null };
   assert.deepEqual(manifestFolders(m), ['tiles/A/', 'blocks/A/', 'thick/A/']);
