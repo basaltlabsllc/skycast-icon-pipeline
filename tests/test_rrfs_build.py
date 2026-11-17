@@ -130,7 +130,12 @@ def test_cli_nothing_to_do(tmp_path, monkeypatch):
 
 def test_cli_builds_a_sample_and_rate_limits_every_request(tmp_path, monkeypatch):
     import rrfs_build
+    from tests.test_rrfs_wind import _wind_files
     f = _files([0, 3])
+    for fh in (0, 3):                  # the prslev wind file of each hour, served beside the cover
+        w = _wind_files(fh, run=RUN)
+        f.blobs.update(w.blobs)
+        f.idx.update(w.idx)
     n = {"acquired": 0}
 
     class Counting:
@@ -144,7 +149,9 @@ def test_cli_builds_a_sample_and_rate_limits_every_request(tmp_path, monkeypatch
     assert rrfs_build.main(["--out", str(tmp_path), "--hours", "0,3"]) == 0
     m = json.loads((tmp_path / "manifest.json").read_text())
     assert len(m["stepsMs"]) == 2 and m["complete"] is False
-    assert n["acquired"] == len(f.calls) == 2 * 5        # one idx and four ranges an hour, all counted
+    assert "wind" in m and (tmp_path / "wind" / "2026110912").is_dir()
+    # cover: one idx and four ranges an hour; wind: one idx and three ranges (each level's U+V is one range); all counted
+    assert n["acquired"] == len(f.calls) == 2 * (5 + 4)
 
 
 def test_cli_failed_build_exits_1(tmp_path, monkeypatch):
