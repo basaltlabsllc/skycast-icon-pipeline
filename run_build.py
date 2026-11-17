@@ -21,7 +21,7 @@ from collections import namedtuple
 from pathlib import Path
 import numpy as np
 
-from pipeline import blocks, columns, dwd, history, live, published, site, thick
+from pipeline import blocks, columns, dwd, history, live, pack, published, site, thick
 from pipeline.encode import encode_square, quantize, FIELD_COUNT
 from pipeline.regrid import ensure_kit, regrid, lattice_levels, regrid_values
 from pipeline.squares import all_squares, parse_name, slice_square, NX, NY
@@ -232,11 +232,31 @@ def build(site, state, work, deps, pages_base, steps=None, squares=None, workers
                                                       history_since_ms=hist_since))
     thickness = build_thick(blob, state, work, deps, kit, run, steps, names, workers, hours)
     cols = build_columns(blob, state, work, deps, kit, run, steps, names, workers)
-    (blob / "manifest.json").write_text(site_manifest(run, deps.now(), hours, names, n_past, full, tail, cols,
-                                                      blocks=site_blocks(run), thick=thickness, repairs=repairs,
-                                                      history_runs=hist_runs, history_since_ms=hist_since))
+    feed = json.loads(site_manifest(run, deps.now(), hours, names, n_past, full, tail, cols,
+                                    blocks=site_blocks(run), thick=thickness, repairs=repairs,
+                                    history_runs=hist_runs, history_since_ms=hist_since))
+    # Blob's manifest alone names the packs (Pages has none of them).
+    feed = pack.add_pack_keys(feed, build_packs(site, blob, run, tail, thickness, cols),
+                              tile_files=pack.tile_files_on())
+    (blob / "manifest.json").write_text(json.dumps(feed, separators=(",", ":")))
     print(f"built {len(names)} squares, {len(hours)} steps ({n_past} history)")
     return BUILT
+
+
+def build_packs(site_dir, blob_dir, run, tail, thickness, cols):
+    """One PACK1 pack per per-square folder (pipeline/pack.py), every one
+    written into blob_dir at the folder's own path: the squares and the tail
+    are read from site_dir (Pages carries them per file, and never a pack), the
+    blocks, thickness and columns from blob_dir. {kind: pack path or None}; a
+    failed pack is a ::warning:: and None, never a failed build."""
+    site_dir, blob_dir = Path(site_dir), Path(blob_dir)
+    return {
+        "tiles": pack.try_pack(site_dir, site_tiles(run), dest=blob_dir),
+        "tail": pack.try_pack(site_dir, tail["tiles"], dest=blob_dir) if tail else None,
+        "blocks": pack.try_pack(blob_dir, site_blocks(run)),
+        "thick": pack.try_pack(blob_dir, thickness["tiles"]) if thickness else None,
+        "columns": pack.try_pack(blob_dir, cols["tiles"]) if cols else None,
+    }
 
 
 # Pages refuses a site over 1 GB; leave room for the manifest and a tail.
