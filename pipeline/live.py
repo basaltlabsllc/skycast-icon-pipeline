@@ -21,6 +21,12 @@ FAMILIES = ("columns", "thick", "blocks", "tail")
 MAX_REPAIRS = 2
 
 
+def _has(m, family):
+    # With FEED_TILE_FILES=0 (pipeline/pack.py) the day blocks are named only
+    # by blocksPack; the other families stay objects that carry "pack".
+    return bool(m.get(family) or m.get(f"{family}Pack"))
+
+
 def http_text(url, timeout=60, attempts=3, urlopen=urllib.request.urlopen, sleep=time.sleep):
     """GET url as text, retrying a dropped connection, a reset, a timeout or a
     5xx after a short pause. A 4xx is raised at once: retrying will not help."""
@@ -58,7 +64,7 @@ def live_status(fetch_text, pages_base, blob_base=BLOB_BASE):
     outage cannot set builds looping."""
     m = _manifest(fetch_text, blob_base)
     if m is not None:
-        whole = bool(m.get("complete")) and all(m.get(f) for f in FAMILIES)
+        whole = bool(m.get("complete")) and all(_has(m, f) for f in FAMILIES)
         return m.get("run"), whole, int(m.get("repairs") or 0)
     m = _manifest(fetch_text, pages_base)
     if m is not None:
