@@ -9,6 +9,11 @@
 # ICON feed's file and manifest shape) over the same hours as the squares.
 # It is read after the cover; if any hour of it fails the build publishes the
 # cover without a "thick" key rather than failing (run_build.build_thick's rule).
+#
+# Wind: wind/<YYYYMMDDHH>/<group>.icw (ICW1, pipeline/wind.py), u/v at
+# 850/500/250 hPa on a 1 degree lattice, turned from HRRR's grid-relative
+# components to east/north, over the same hours. A failure or running past
+# WIND_BUDGET_S drops the "wind" key and files; the cover is published anyway.
 import concurrent.futures as cf
 import datetime as dt
 import json
@@ -19,16 +24,17 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import blocks, thick
+from pipeline import blocks, thick, wind
 from pipeline.dwd import run_iso
 from pipeline.encode import encode_square
-from pipeline.site import build_manifest, thick_path, tiles_path
+from pipeline.site import build_manifest, thick_path, tiles_path, wind_path
 from pipeline.squares import SIDE, parse_name
 
-from .grib import FIELDS, file_url, read_fields, read_thick
+from .grib import FIELDS, file_url, read_fields, read_thick, read_wind
 from .grid import SQUARES, bin_index, box_average, box_mean
 
 RETRIES = 2          # extra attempts per forecast hour
+WIND_BUDGET_S = 600  # build_wind gives up after this long: the cover must still go out inside the workflow timeout
 ATTRIBUTION = "Cloud data: NOAA HRRR"
 
 
@@ -109,6 +115,65 @@ def build_thick(run, out_dir, get, sleep, fhs, bins, workers):
             "tiles": thick_path(run)}
 
 
+def _read_wind_step(run, fh, get, sleep):
+    for attempt in range(RETRIES + 1):
+        try:
+            return read_wind(run, fh, get)
+        except Exception:
+            if attempt == RETRIES:
+                raise
+            sleep(2 * (attempt + 1))
+
+
+class _OverBudget(Exception):
+    pass
+
+
+def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, clock=time.monotonic):
+    """wind/<run>/<group>.icw over the hours fhs; returns the manifest's `wind`
+    entry, or None (any failure, or more than budget_s seconds: the files are
+    removed and the cover goes out without wind). Groups HRRR's domain does not
+    touch are not written."""
+    t0 = clock()
+    deadline = t0 + budget_s
+
+    def one(fh):
+        if clock() > deadline:
+            raise _OverBudget()
+        d = _read_wind_step(run, fh, get, sleep)
+        return {k: wind.lattice_from_points(d["lat"], d["lon"], d[k]).astype(np.float32)
+                for k in d if k not in ("lat", "lon")}
+
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
+        try:
+            futures = [ex.submit(one, fh) for fh in fhs]
+            per = []
+            for f in futures:
+                try:
+                    per.append(f.result(timeout=max(0.0, deadline - clock())))
+                except cf.TimeoutError:
+                    raise _OverBudget()
+                if clock() > deadline:
+                    raise _OverBudget()
+        except BaseException:
+            ex.shutdown(wait=True, cancel_futures=True)
+            raise
+        ex.shutdown(wait=True)
+        base_hour = int(run.timestamp() // 3600)
+        total = wind.write_wind(out_dir, run, [base_hour + fh for fh in fhs], per)
+        groups = len(list((Path(out_dir) / wind_path(run)).glob("*.icw")))
+    except Exception as e:
+        if isinstance(e, _OverBudget):
+            print(f"::warning::wind: over budget ({clock() - t0:.0f} s), dropped")
+        else:
+            print(f"::warning::wind failed: {type(e).__name__}: {e}")
+        shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
+        return None
+    print(f"wind: {groups} groups, {len(fhs)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
+    return wind.manifest_entry(run)
+
+
 def build(run, out_dir, get, now, sleep=time.sleep, fhs=None):
     """Write out_dir/tiles/<YYYYMMDDHH>/<name>.icl for every SQUARES entry,
     out_dir/thick/... when thickness could be read, and out_dir/manifest.json.
@@ -144,11 +209,14 @@ def build(run, out_dir, get, now, sleep=time.sleep, fhs=None):
         (tiles / f"{name}.icl").write_bytes(encode_square(sl, so, hours, cube))
         names.append(name)
     thickness = build_thick(run, out_dir, get, sleep, fhs, bins, workers)
+    wind_entry = build_wind(run, out_dir, get, sleep, fhs, workers)
     m = json.loads(build_manifest(run, now, hours, names, 0, complete=fhs == list(range(last + 1)),
                                   thick=thickness))
     m["model"] = "hrrr"
     m["attribution"] = ATTRIBUTION
     for k in ("blocks", "columns", "tail") + (() if thickness else ("thick",)):
         m.pop(k, None)
+    if wind_entry:
+        m["wind"] = wind_entry
     (out_dir / "manifest.json").write_text(json.dumps(m, separators=(",", ":")))
     return names

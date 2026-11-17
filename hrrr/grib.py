@@ -150,3 +150,86 @@ def read_fields(run, fh, get):
             eccodes.codes_release(g)
         out[name] = np.where(np.isclose(vals, miss) | (vals < 0), np.nan, vals)
     return out
+
+
+# ---- Wind (ICW1) --------------------------------------------------------------
+# u/v at 850 / 500 / 250 mb (the low, mid and high deck's steering levels) from
+# the surface file. HRRR's components follow its Lambert grid (uvRelativeToGrid
+# = 1), not east and north, so each point is turned by the grid's convergence
+# angle before it goes on the lattice: sin(Latin1) x (lon - LoV).
+WIND_LEVELS = (850, 500, 250)
+
+
+def wind_ranges(sfc_idx, fh):
+    """{(level hPa, 'u'|'v'): (start, end)} for forecast hour fh (f00 reads
+    "anl") from the surface file's idx. KeyError if any of the six is missing."""
+    want = "anl" if fh == 0 else f"{fh} hour fcst"
+    rows = _rows(sfc_idx)
+    out = {}
+    for lev in WIND_LEVELS:
+        for comp, name in (("u", "UGRD"), ("v", "VGRD")):
+            k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
+                      and r[4] == f"{lev} mb" and r[5] == want), None)
+            if k is None:
+                raise KeyError(f"{name} ({lev} mb, {want}) not in idx")
+            out[(lev, comp)] = _range_of(rows, k)
+    return out
+
+
+def rotate_to_earth(u, v, lon, lov_deg, latin1_deg):
+    """Grid-relative (u, v) on a Lambert conformal grid -> east/north (ue, ve).
+    The grid's x axis lies a = sin(Latin1) x (lon - LoV) counter-clockwise of
+    east, so ue = cos a u + sin a v and ve = -sin a u + cos a v. lon and LoV in
+    degrees east, either -180..180 or 0..360."""
+    dlon = (np.asarray(lon, dtype=np.float64) - lov_deg + 180.0) % 360.0 - 180.0
+    a = np.sin(np.radians(latin1_deg)) * np.radians(dlon)
+    c, s = np.cos(a), np.sin(a)
+    u = np.asarray(u, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    return c * u + s * v, -s * u + c * v
+
+
+def _wind_geometry(g):
+    """(lat, lon, rotation) of one message: rotation is None when its components
+    already point east/north, else (LoV, Latin1) in degrees. A grid type other
+    than the two HRRR files and the tests use is an error, not a guess."""
+    kind = str(eccodes.codes_get(g, "gridType"))
+    lat = eccodes.codes_get_array(g, "latitudes")
+    lon = eccodes.codes_get_array(g, "longitudes")
+    lon = np.where(lon > 180, lon - 360, lon)
+    if kind == "regular_ll":
+        return lat, lon, None
+    if kind != "lambert":
+        raise ValueError(f"wind: unsupported grid {kind}")
+    if not int(eccodes.codes_get(g, "uvRelativeToGrid")):
+        return lat, lon, None
+    return lat, lon, (float(eccodes.codes_get(g, "LoVInDegrees")), float(eccodes.codes_get(g, "Latin1InDegrees")))
+
+
+def read_wind(run, fh, get):
+    """The six wind fields of one forecast hour, turned to east/north, in m/s:
+    {"lat", "lon" (-180..180), (level, 'u'|'v'): array}, flat over HRRR's cells,
+    NaN where missing. get(url, rng=None) -> bytes is injected. Each message's
+    own shortName and level must match the idx row that asked for it."""
+    url = file_url(run, fh)
+    ranges = wind_ranges(get(url + ".idx").decode(), fh)
+    out, raw, rot = {}, {}, None
+    for key, rng in ranges.items():
+        g = eccodes.codes_new_from_message(get(url, rng))
+        try:
+            got = (str(eccodes.codes_get(g, "shortName")), int(round(float(eccodes.codes_get(g, "level")))))
+            if got != (key[1], key[0]):
+                raise ValueError(f"wind: expected {key[1]} {key[0]} hPa, message is {got[0]} {got[1]}")
+            if "lat" not in out:
+                out["lat"], out["lon"], rot = _wind_geometry(g)
+            vals = eccodes.codes_get_values(g)
+            miss = eccodes.codes_get(g, "missingValue")
+        finally:
+            eccodes.codes_release(g)
+        raw[key] = np.where(np.isclose(vals, miss), np.nan, vals)
+    for lev in WIND_LEVELS:
+        u, v = raw.pop((lev, "u")), raw.pop((lev, "v"))
+        if rot is not None:
+            u, v = rotate_to_earth(u, v, out["lon"], rot[0], rot[1])
+        out[(lev, "u")], out[(lev, "v")] = u, v
+    return out
