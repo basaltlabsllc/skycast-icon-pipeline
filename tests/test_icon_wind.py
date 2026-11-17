@@ -104,3 +104,53 @@ def test_over_budget_drops_the_wind(tmp_path, capsys):
                                budget_s=250, clock=lambda: next(ticks))
     assert out is None and not (tmp_path / "blob" / "wind").exists()
     assert "::warning::wind: over budget" in capsys.readouterr().out
+
+
+# ---- through build() ---------------------------------------------------------
+from tests.test_run_build import _fake_deps, UTC as _U, RUN as BRUN   # noqa: E402
+
+
+def _wind_listing(deps, steps):
+    listed = deps.listing
+    extra = dwd.wind_files(BRUN, steps)
+    return lambda hh, field: (listed(hh, field) if field not in extra else
+                              "".join(f'<a href="{n}">x</a>' for n in extra[field]) if hh == "00" else "")
+
+
+def _build(tmp_path, deps):
+    return run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
+                           deps=deps, pages_base=None, steps=[0, 1], squares=["N40W125"], workers=2)
+
+
+def test_build_names_the_wind_in_the_blob_manifest(tmp_path):
+    deps, _ = _fake_deps(tmp_path)
+    deps = deps._replace(listing=_wind_listing(deps, [0, 1]))
+    plain = deps.regrid_values
+
+    def rv(path, kit, work):
+        if "_U." in Path(path).name or "_V." in Path(path).name:
+            return np.full((NY, NX), 5.0, dtype=np.float32)
+        return plain(path, kit, work)
+
+    assert _build(tmp_path, deps._replace(regrid_values=rv)) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    assert m["wind"]["runMs"] == int(BRUN.timestamp() * 1000)
+    assert (tmp_path / "blob" / "wind" / "2026092700" / "N30W100.icw").exists()
+    assert "wind" not in json.loads((tmp_path / "site" / "manifest.json").read_text())
+
+
+def test_a_failing_wind_download_still_publishes_the_cover(tmp_path):
+    deps, _ = _fake_deps(tmp_path)
+    good = deps.download
+
+    def dl(url, dst):
+        if "_850_V" in url:
+            raise OSError("boom")
+        good(url, dst)
+
+    deps = deps._replace(listing=_wind_listing(deps, [0, 1]), download=dl)
+    assert _build(tmp_path, deps) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    assert "wind" not in m and m["thick"] is not None
+    assert not (tmp_path / "blob" / "wind").exists()
+    assert (tmp_path / "site" / "manifest.json").exists()

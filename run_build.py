@@ -482,7 +482,7 @@ def build_thick(blob_dir, state, work, deps, kit, run, steps, names, workers, ho
 # never decides whether the run goes out: wait this long for the files, then
 # publish without wind. ICON's regridded U/V are already east/north, so no
 # rotation is needed.
-WIND_WAIT_S = 10 * 60
+WIND_WAIT_S = 5 * 60
 WIND_BUDGET_S = 15 * 60     # a full run projects to 4-6 min (see build_wind)
 _WIND_COMPS = {"U": "u", "V": "v"}
 
@@ -499,13 +499,17 @@ def build_wind(blob_dir, work, deps, kit, run, steps, workers, budget_s=None, cl
     """wind/<run>/<group>.icw (ICW1) over `steps`, the same steps the cover
     and the thickness use; returns the manifest's `wind` entry, or None.
 
+    Tail hours (dwd.TAIL_STEPS, from the newest whole 00Z/12Z run) and history
+    hours get no wind, on purpose: they come from other runs, and a step's wind
+    must come from the run that supplied its cover.
+
     Any failure, or more than `budget_s` seconds (default WIND_BUDGET_S, counted
     from when the files are all listed), removes wind/ and returns None: the
     cover goes out without wind. The budget exists because the ICON workflow
     has a 150-minute job timeout and nothing inside it: wind runs after the
     cover, the thickness and the tail but before the column feed, so it may
     spend at most this long and the columns and the publish still fit: the
-    worst case is the three waits (15 + 10 + 15 min) plus the cover (~7 min),
+    worst case is the three waits (15 + 5 + 15 min) plus the cover (~7 min),
     this budget (15) and the columns (~13), far inside the 150."""
     budget_s = WIND_BUDGET_S if budget_s is None else budget_s
     steps = list(steps)
