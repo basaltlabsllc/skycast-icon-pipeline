@@ -62,6 +62,8 @@ jobs:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.AIFS_BLOB_READ_WRITE_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STATE_KEEP: ${{ steps.state.outputs.keep }}
+          # pipeline/pack.py: "1" names the per-file folders AND the packs (<kind>/<run>/pack/) in the manifest, so both go up; "0" names only the packs once the app that reads them is out.
+          FEED_TILE_FILES: "1"
         run: |
           end=$(( $(date +%s) + 5 * 3600 ))
           while [ "$(date +%s)" -lt "$end" ]; do
