@@ -30,6 +30,10 @@ def thick_path(run):
     return f"thick/{run_id(run)}"
 
 
+def wind_path(run):
+    return f"wind/{run_id(run)}"
+
+
 def build_manifest(run, built, step_hours, squares, history_hours, complete=True, tail=None, columns=None,
                    blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None):
     out = {
