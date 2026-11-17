@@ -6,6 +6,8 @@ import json
 import numpy as np
 import eccodes
 
+from pipeline import wind
+
 G = 9.80665
 _MASS = (("ICMR", "ice"), ("CLMR", "water"))
 
@@ -212,4 +214,66 @@ def read_column_thick(model, run, fh, get):
             out[name] = _decode(g)
         finally:
             eccodes.codes_release(g)
+    return out
+
+
+# ---- Wind (ICW1) --------------------------------------------------------------
+# u and v at 850, 500 and 250 hPa (pipeline.wind.LEVELS), m/s, on the source grid.
+
+def wind_ranges(model, index_text, fh):
+    """{(level, 'u'|'v'): (start, end)} for the six wind messages of one forecast
+    hour; end is inclusive or None for the file's last message. NCEP rows are
+    picked by exact name (UGRD / VGRD), "<lev> mb" and forecast text ("anl" at
+    f000); ECMWF rows by param u / v, levtype pl and levelist. KeyError if a
+    row is missing."""
+    out = {}
+    if model.index_kind == "ncep":
+        want = "anl" if fh == 0 else f"{fh} hour fcst"
+        rows = [ln.split(":") for ln in index_text.strip().split("\n") if ln.strip()]
+        for lev in wind.LEVELS:
+            for comp, name in (("u", "UGRD"), ("v", "VGRD")):
+                k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
+                          and r[4] == f"{lev} mb" and r[5] == want), None)
+                if k is None:
+                    raise KeyError(f"{name} ({lev} mb, {want}) not in idx")
+                start = int(rows[k][1])
+                out[(lev, comp)] = (start, int(rows[k + 1][1]) - 1 if k + 1 < len(rows) else None)
+        return out
+    rows = [json.loads(ln) for ln in index_text.strip().split("\n") if ln.strip()]
+    for lev in wind.LEVELS:
+        for comp in "uv":
+            r = next((r for r in rows if r.get("param") == comp and r.get("levtype") == "pl"
+                      and str(r.get("levelist")) == str(lev)), None)
+            if r is None:
+                raise KeyError(f"{comp} (pl {lev}) not in index")
+            out[(lev, comp)] = (r["_offset"], r["_offset"] + r["_length"] - 1)
+    return out
+
+
+def read_wind_step(model, run, fh, get):
+    """The six wind fields of one forecast hour: {"lat": 1-D, "lon": 1-D (-180..180),
+    (level, 'u'|'v'): float [nlat][nlon] m/s}, the source's regular grid. get(url, rng=None) -> bytes is
+    injected; messages whose rows touch are fetched as one range."""
+    ranges = wind_ranges(model, get(model.index_url(run, fh)).decode(), fh)
+    keys = list(ranges)
+    url = model.url(run, fh)
+    out = {}
+    for rng, positions in _groups([(k, ranges[k]) for k in keys]):
+        msgs = split_messages(get(url, rng))
+        if len(msgs) != len(positions):
+            raise ValueError(f"wind: asked for {len(positions)} messages, got {len(msgs)}")
+        for pos, raw in zip(positions, msgs):
+            g = eccodes.codes_new_from_message(raw)
+            try:
+                ni, nj = eccodes.codes_get(g, "Ni"), eccodes.codes_get(g, "Nj")
+                if "lat" not in out:
+                    lat = eccodes.codes_get_array(g, "latitudes").reshape(nj, ni)
+                    lon = eccodes.codes_get_array(g, "longitudes").reshape(nj, ni)
+                    out["lat"] = lat[:, 0]
+                    out["lon"] = np.where(lon[0] > 180, lon[0] - 360, lon[0])
+                vals = eccodes.codes_get_values(g).reshape(nj, ni)
+                miss = eccodes.codes_get(g, "missingValue")
+            finally:
+                eccodes.codes_release(g)
+            out[keys[pos]] = np.where(np.isclose(vals, miss), np.nan, vals)
     return out

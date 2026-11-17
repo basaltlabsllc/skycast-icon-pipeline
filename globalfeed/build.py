@@ -10,6 +10,10 @@
 #                          model.main_steps alone: no history, no tail. A failure
 #                          here drops the thick key and files; the cover is
 #                          published anyway.
+#   wind/<run>/<grp>.icw   ICW1, u/v at 850/500/250 hPa on a 1 degree lattice in
+#                          20 degree groups (pipeline/wind.py), over main + tail
+#                          steps, for models with wind=True. A failure drops the
+#                          wind key and files; the cover is published anyway.
 #   manifest.json
 # Memory follows hrrr/build.py: each worker reads one hour, puts it on the
 # feed's grid and cuts it straight into per-square uint8 [4][41][41] slices,
@@ -24,14 +28,14 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import blocks, history, published, thick
+from pipeline import blocks, history, published, thick, wind
 from pipeline.dwd import run_id, run_iso
 from pipeline.encode import encode_square, quantize
-from pipeline.site import blocks_path, build_manifest, tail_path, thick_path, tiles_path
+from pipeline.site import blocks_path, build_manifest, tail_path, thick_path, tiles_path, wind_path
 from pipeline.squares import all_squares, parse_name, slice_square
 
 from . import history6
-from .grib import read_step, read_thick_step
+from .grib import read_step, read_thick_step, read_wind_step
 from .latlon import to_feed, to_feed_float
 
 RETRIES = 2          # extra attempts per forecast hour
@@ -163,6 +167,50 @@ def build_thick(model, run, out_dir, get, sleep, names):
             "tiles": thick_path(run)}
 
 
+def _read_wind(model, run, fh, get, sleep):
+    for attempt in range(RETRIES + 1):
+        try:
+            return read_wind_step(model, run, fh, get)
+        except Exception:
+            if attempt == RETRIES:
+                raise
+            sleep(2 * (attempt + 1))
+
+
+def build_wind(model, run, out_dir, get, sleep):
+    """wind/<run>/<group>.icw (ICW1) over model.main_steps + model.tail_steps;
+    returns the manifest's `wind` entry, or None (the model builds no wind, or any
+    failure: the files are removed and the cover goes out without wind)."""
+    if not model.wind:
+        return None
+    t0 = time.monotonic()
+    steps = tuple(model.main_steps) + tuple(model.tail_steps)
+
+    def one(fh):
+        d = _read_wind(model, run, fh, get, sleep)
+        return {k: wind.lattice_from_regular(d["lat"], d["lon"], d[k]).astype(np.float32)
+                for k in d if k not in ("lat", "lon")}
+
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, model.workers))
+    try:
+        try:
+            futures = [ex.submit(one, fh) for fh in steps]
+            per = [f.result() for f in futures]
+        except BaseException:
+            ex.shutdown(wait=True, cancel_futures=True)
+            raise
+        ex.shutdown(wait=True)
+        base = history.hour_of(run)
+        total = wind.write_wind(out_dir, run, [base + s for s in steps], per)
+        groups = len(list((Path(out_dir) / wind_path(run)).glob("*.icw")))
+    except Exception as e:
+        print(f"::warning::wind failed: {type(e).__name__}: {e}")
+        shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
+        return None
+    print(f"wind: {groups} groups, {len(steps)} steps, {total / 1e6:.1f} MB, {time.monotonic() - t0:.0f} s")
+    return wind.manifest_entry(run)
+
+
 def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None):
     """Write the run into out_dir; returns the square names. A step that still
     fails after its retries raises: a build is all or nothing (thickness
@@ -222,6 +270,7 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None):
                 "stepsMs": [h * 3600 * 1000 for h in tail_hours], "tiles": tail_path(run)}
 
     thickness = build_thick(model, run, out_dir, get, sleep, names)
+    wind_entry = build_wind(model, run, out_dir, get, sleep)
     try:
         hist_runs = published.history_runs(state, run)
         hist_since = published.since(state)
@@ -233,6 +282,8 @@ def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None):
                                   history_since_ms=hist_since))
     for k in ("columns",) + (() if thickness else ("thick",)):
         m.pop(k, None)
+    if wind_entry:
+        m["wind"] = wind_entry
     m["model"] = model.name
     m["attribution"] = model.attribution
     (Path(out_dir) / "manifest.json").write_text(json.dumps(m, separators=(",", ":")))

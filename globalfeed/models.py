@@ -47,6 +47,9 @@ class Model:
     # both as paramId 3073 (%) and 186 (0 - 1), so the encoding decides. False:
     # take the values as they are (GFS and AIFS, both measured as percent).
     check_cover_units: bool = False
+    # True: also build the 850/500/250 hPa wind (ICW1, pipeline/wind.py) for the
+    # app's cloud drift. A failure drops the wind key; the cover goes out anyway.
+    wind: bool = False
 
     def __post_init__(self):
         if self.thick_levels and self.thick_fields:
@@ -89,6 +92,7 @@ GFS = Model(
     # CWAT: median ratio 0.998, correlation 0.994, plan 2026-11-09).
     thick_levels=(100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750,
                   800, 850, 900, 925, 950, 975, 1000),
+    wind=True,
 )
 
 AIFS = Model(

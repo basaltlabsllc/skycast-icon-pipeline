@@ -39,7 +39,7 @@ def group_name(sw_lat, sw_lon):
 def group_of(lat, lon):
     """The group whose cell holds the whole-degree node (lat, lon)."""
     la = min(70, -90 + GROUP_DEG * int(np.floor((lat + 90) / GROUP_DEG)))
-    lo = ((int(lon) + 180) % 360) // GROUP_DEG * GROUP_DEG - 180
+    lo = ((int(np.floor(lon)) + 180) % 360) // GROUP_DEG * GROUP_DEG - 180
     return group_name(la, lo)
 
 
