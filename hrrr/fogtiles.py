@@ -1,9 +1,19 @@
 # hrrr/fogtiles.py — HRRR's fog fields as ICC1 tiles, 41 x 41 nodes of 25 mdeg
 # (about 2 km) over 1-degree tiles, a block of FOG_BLOCK_HOURS steps per file:
 #   fog/<YYYYMMDDHH>/<tile>/<k>.icc, block k = steps [k*B, (k+1)*B) of the run.
+# PACKS (ICCP1, 2026-11-17): every tile file of block k is also concatenated, in
+# tileNames order, into fog/<YYYYMMDDHH>/pack/<k>.iccp, with
+# fog/<YYYYMMDDHH>/pack/index.json = {"format": "ICCP1", "run", "tileNames",
+# "ends": [[end byte of tile 0, ..., of tile N-1] per block]}. Tile i of block k
+# is bytes [ends[k][i-1] (0 for i = 0), ends[k][i]) of the pack, byte-identical
+# to its tile file; the app reads it by HTTP range. One upload per block instead
+# of one per tile (~6,500 a run). tile_files=False (FOG_TILE_FILES=0) writes
+# only the packs and leaves "tiles" out of the entry, so app builds that read
+# tile files see no HRRR fog and keep ICON's.
 # Nodes are bilinearly sampled from HRRR's 3 km Lambert grid (hrrr/fog.py). The
 # lattice-to-grid indices are computed once per run and reused for every field
 # and hour. Constants: docs/hrrr-fog-measure.md.
+import json
 from pathlib import Path
 
 import numpy as np
@@ -37,12 +47,17 @@ def fog_path(run):
     return f"fog/{run_id(run)}"
 
 
+def pack_path(run):
+    return f"{fog_path(run)}/pack"
+
+
 def _sample(fields, key, ny, nx, fi, fj):
     return sample_bilinear(fields[key].reshape(ny, nx), fi, fj)
 
 
-def build_fog(run, out_dir, get, steps):
-    """Write out_dir/fog/<YYYYMMDDHH>/<tile>/<k>.icc and return the manifest's
+def build_fog(run, out_dir, get, steps, tile_files=True):
+    """Write out_dir/fog/<YYYYMMDDHH>/pack/<k>.iccp + index.json and, with
+    tile_files, out_dir/fog/<YYYYMMDDHH>/<tile>/<k>.icc; return the manifest's
     `fog` entry. steps: the forecast hours of the run (a list) or their count
     (hours 0..steps-1). Memory is one block of tiles at a time."""
     fhs = list(range(steps)) if isinstance(steps, int) else [int(f) for f in steps]
@@ -88,6 +103,9 @@ def build_fog(run, out_dir, get, steps):
     del first   # the raw step-0 fields are 27 x 1.9 M floats; keep only the codes
 
     root = out_dir / fog_path(run)
+    pack_dir = out_dir / pack_path(run)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    ends = []
     for k0 in range(0, len(fhs), FOG_BLOCK_HOURS):
         block = fhs[k0:k0 + FOG_BLOCK_HOURS]
         cube = np.empty((len(names), len(block)) + codes0.shape[1:], np.uint16)   # [tiles][steps][fields][n][n]
@@ -95,13 +113,25 @@ def build_fog(run, out_dir, get, steps):
             cube[:, s_i] = codes0 if fh == fhs[0] else codes_for(read_fog_fields(run, fh, get))
         hours = [base_hour + fh for fh in block]
         k = k0 // FOG_BLOCK_HOURS
-        for t, name in enumerate(names):
-            la, lo = cands[keep[t]]
-            d = root / name
-            d.mkdir(parents=True, exist_ok=True)
-            (d / f"{k}.icc").write_bytes(encode_columns_grid(
-                la, lo, FOG_SPACING_MDEG, FOG_N, hours, spec, cube[t], static[t]))
-    return {"format": "ICC1", "run": run_iso(run), "runMs": int(run.timestamp() * 1000),
-            "stepsMs": [(base_hour + fh) * 3600_000 for fh in fhs], "tiles": fog_path(run),
-            "tileDeg": FOG_TILE_DEG, "spacingMdeg": FOG_SPACING_MDEG, "blockHours": FOG_BLOCK_HOURS,
-            "tileNames": names}
+        block_ends, at = [], 0
+        with open(pack_dir / f"{k}.iccp", "wb") as pack:
+            for t, name in enumerate(names):
+                la, lo = cands[keep[t]]
+                body = encode_columns_grid(la, lo, FOG_SPACING_MDEG, FOG_N, hours, spec, cube[t], static[t])
+                if tile_files:
+                    d = root / name
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{k}.icc").write_bytes(body)
+                pack.write(body)
+                at += len(body)
+                block_ends.append(at)
+        ends.append(block_ends)
+    (pack_dir / "index.json").write_text(json.dumps(
+        {"format": "ICCP1", "run": run_iso(run), "tileNames": names, "ends": ends}, separators=(",", ":")))
+    entry = {"format": "ICC1", "run": run_iso(run), "runMs": int(run.timestamp() * 1000),
+             "stepsMs": [(base_hour + fh) * 3600_000 for fh in fhs]}
+    if tile_files:
+        entry["tiles"] = fog_path(run)
+    entry.update({"pack": pack_path(run), "tileDeg": FOG_TILE_DEG, "spacingMdeg": FOG_SPACING_MDEG,
+                  "blockHours": FOG_BLOCK_HOURS, "tileNames": names})
+    return entry

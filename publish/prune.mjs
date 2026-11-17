@@ -17,6 +17,9 @@ export function manifestFolders(m) {
   for (const k of ['tail', 'columns', 'thick', 'wind', 'fog']) {
     if (m && m[k] && typeof m[k].tiles === 'string' && m[k].tiles) out.push(m[k].tiles.replace(/\/?$/, '/'));
   }
+  // The fog packs (fog/<run>/pack/, ICCP1): with FOG_TILE_FILES=0 the entry
+  // names only `pack`, no `tiles`, and the pack folder is the whole fog run.
+  if (m && m.fog && typeof m.fog.pack === 'string' && m.fog.pack) out.push(m.fog.pack.replace(/\/?$/, '/'));
   return out;
 }
 

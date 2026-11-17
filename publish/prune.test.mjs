@@ -151,3 +151,23 @@ test('with keepHours, runs begun within it keep their clouds, thickness and run 
     'tiles/2026111418/a.icl', 'thick/2026111418/a.ict', 'runs/2026111418.json',
   ]);
 });
+
+test('fog packs: an entry with only `pack` (FOG_TILE_FILES=0) keeps its pack folder for current and previous', () => {
+  assert.deepEqual(manifestFolders({ fog: { pack: 'fog/2026111012/pack' } }), ['fog/2026111012/pack/']);
+  const c = { tiles: 'tiles/B', fog: { pack: 'fog/B/pack' } }, p = { tiles: 'tiles/A', fog: { pack: 'fog/A/pack' } };
+  const paths = ['manifest.json', 'fog/B/pack/0.iccp', 'fog/B/pack/index.json', 'fog/A/pack/3.iccp', 'fog/Z/pack/0.iccp', 'fog/Z/N44W122/0.icc'];
+  assert.deepEqual(pathsToDelete(paths, { current: c, previous: p }), ['fog/Z/pack/0.iccp', 'fog/Z/N44W122/0.icc']);
+});
+
+test('fog packs: an entry with tiles AND pack keeps the whole fog run, tile files and packs', () => {
+  const m = { fog: { tiles: 'fog/2026111012', pack: 'fog/2026111012/pack' } };
+  assert.deepEqual(manifestFolders(m), ['fog/2026111012/', 'fog/2026111012/pack/']);
+  const paths = ['fog/2026111012/N44W122/0.icc', 'fog/2026111012/pack/0.iccp', 'fog/2026111012/pack/index.json', 'fog/2026111011/pack/0.iccp'];
+  assert.deepEqual(pathsToDelete(paths, { current: { tiles: 'tiles/2026111012', ...m }, previous: null }), ['fog/2026111011/pack/0.iccp']);
+});
+
+test('fog packs: the backlog cleanup reads a pack-only fog run', () => {
+  const live = { tiles: 'tiles/2026111012', fog: { pack: 'fog/2026111012/pack' } };
+  const paths = ['fog/2026111012/pack/0.iccp', 'fog/2026111011/pack/0.iccp', 'fog/2026111010/pack/0.iccp'];
+  assert.deepEqual(backlogToDelete(paths, live), ['fog/2026111010/pack/0.iccp']);
+});

@@ -31,8 +31,8 @@ import { createRetry, paceDelay, filesToSend } from './pace.mjs';
 import { pruneOldRuns, DELETES_PER_SEC } from './sweep.mjs';
 import { listAll as listStore, readManifest } from './store.mjs';
 import { stampManifest } from './stamp.mjs';
+import { putOptionsFor } from './upload.mjs';
 
-const YEAR_S = 365 * 24 * 3600;
 const MANIFEST_S = 60;            // Blob's shortest cache time
 const CONCURRENCY = 16;           // Pro allows 75 uploads/s; leave room for retries
 const ATTEMPTS = 4;
@@ -91,10 +91,8 @@ async function main() {
     const body = await readFile(join(dir, path));
     bytesByDir[dir] += body.length;
     countByDir[dir] += 1;
-    await retry(path, () => put(path, body, {
-      access: 'public', addRandomSuffix: false, allowOverwrite: true,
-      cacheControlMaxAge: YEAR_S, contentType: 'application/octet-stream',
-    }));
+    // Files of MULTIPART_BYTES or more (the HRRR fog packs) go up multipart (upload.mjs).
+    await retry(path, () => put(path, body, putOptionsFor(path, body.length)));
   });
   const bytes = Object.values(bytesByDir).reduce((a, b) => a + b, 0);
   console.log(`uploaded ${send.length} files, ${(bytes / 1e6).toFixed(0)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s (`

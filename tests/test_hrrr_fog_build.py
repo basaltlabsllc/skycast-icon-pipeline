@@ -18,17 +18,20 @@ def _fetch(*manifests):
     return fetch_json
 
 
-def _build(calls=None):
-    def build(run, out_dir, get, steps):
+def _build(calls=None, flags=None):
+    def build(run, out_dir, get, steps, tile_files=True):
         if calls is not None:
             calls.append((run, list(steps)))
+        if flags is not None:
+            flags.append(tile_files)
         return dict(ENTRY)
     return build
 
 
-def _run(tmp_path, fetch, build, get=lambda u, r=None: b"", extra=()):
+def _run(tmp_path, fetch, build, get=lambda u, r=None: b"", extra=(), env=None):
     return fb.main(["--out", str(tmp_path / "o"), "--live-manifest", "http://m", *extra],
-                   fetch_json=fetch, get=get, now=lambda: NOW, sleep=lambda s: None, build=build)
+                   fetch_json=fetch, get=get, now=lambda: NOW, sleep=lambda s: None, build=build,
+                   env={} if env is None else env)
 
 
 def test_fog_build_builds_for_live_run(tmp_path, capsys):
@@ -62,7 +65,7 @@ def test_fog_build_skips_when_live_run_moved(tmp_path):
 
 
 def test_fog_build_failure_exit_1(tmp_path):
-    def boom(run, out_dir, get, steps):
+    def boom(run, out_dir, get, steps, tile_files=True):
         raise RuntimeError("no")
     assert _run(tmp_path, _fetch(LIVE), boom) == 1
     assert not (tmp_path / "o" / "manifest.json").exists()
@@ -112,7 +115,7 @@ def test_get_retries_once_then_builds(tmp_path):
             raise OSError("hiccup")
         return b"ok"
 
-    def build(run, out_dir, g, steps):
+    def build(run, out_dir, g, steps, tile_files=True):
         assert g("u") == b"ok"
         return dict(ENTRY)
     assert _run(tmp_path, _fetch(LIVE), build, get=get) == 0
@@ -126,7 +129,7 @@ def test_persistent_get_failure_exit_1(tmp_path):
         n["c"] += 1
         raise OSError("down")
 
-    def build(run, out_dir, g, steps):
+    def build(run, out_dir, g, steps, tile_files=True):
         g("u")
         return dict(ENTRY)
     assert _run(tmp_path, _fetch(LIVE), build, get=get) == 1
@@ -174,7 +177,7 @@ def test_short_body_once_is_retried_then_builds(tmp_path):
     def get(url, rng=None):
         return fb._get(url, rng, opener=lambda req, timeout: _Resp(bodies.pop(0)))
 
-    def build(run, out_dir, g, steps):
+    def build(run, out_dir, g, steps, tile_files=True):
         assert g("http://u", (0, 4)) == b"12345"
         return dict(ENTRY)
     assert _run(tmp_path, _fetch(LIVE), build, get=get) == 0
@@ -185,8 +188,21 @@ def test_persistent_short_body_exit_1(tmp_path):
     def get(url, rng=None):
         return fb._get(url, rng, opener=lambda req, timeout: _Resp(b"12"))
 
-    def build(run, out_dir, g, steps):
+    def build(run, out_dir, g, steps, tile_files=True):
         g("http://u", (0, 4))
         return dict(ENTRY)
     assert _run(tmp_path, _fetch(LIVE), build, get=get) == 1
     assert not (tmp_path / "o" / "manifest.json").exists()
+
+
+def test_fog_tile_files_default_on(tmp_path):
+    flags = []
+    assert _run(tmp_path, _fetch(LIVE), _build(flags=flags)) == 0
+    assert flags == [True]
+
+
+def test_fog_tile_files_env_switch(tmp_path):
+    for value, want in (("1", True), ("0", False), (" 0 ", False), ("", True)):
+        flags = []
+        assert _run(tmp_path / value.strip(), _fetch(LIVE), _build(flags=flags), env={"FOG_TILE_FILES": value}) == 0
+        assert flags == [want], value
