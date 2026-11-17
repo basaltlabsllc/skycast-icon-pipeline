@@ -38,6 +38,7 @@ from . import history6
 from .grib import read_step, read_thick_step, read_wind_step
 from .latlon import to_feed, to_feed_float
 
+WIND_BUDGET_S = 600  # build_wind gives up after this long: the cover must still go out inside the workflow timeout
 RETRIES = 2          # extra attempts per forecast hour
 QUANT_STEP = 2       # the same step the ICON Blob copy uses (run_build.QUANT_STEP)
 SYNOPTIC = (0, 6, 12, 18)
@@ -177,16 +178,24 @@ def _read_wind(model, run, fh, get, sleep):
             sleep(2 * (attempt + 1))
 
 
-def build_wind(model, run, out_dir, get, sleep):
+class _OverBudget(Exception):
+    pass
+
+
+def build_wind(model, run, out_dir, get, sleep, budget_s=WIND_BUDGET_S, clock=time.monotonic):
     """wind/<run>/<group>.icw (ICW1) over model.main_steps + model.tail_steps;
     returns the manifest's `wind` entry, or None (the model builds no wind, or any
-    failure: the files are removed and the cover goes out without wind)."""
+    failure or more than budget_s seconds: the files are removed and the cover
+    goes out without wind)."""
     if not model.wind:
         return None
-    t0 = time.monotonic()
+    t0 = clock()
+    deadline = t0 + budget_s
     steps = tuple(model.main_steps) + tuple(model.tail_steps)
 
     def one(fh):
+        if clock() > deadline:
+            raise _OverBudget()
         d = _read_wind(model, run, fh, get, sleep)
         return {k: wind.lattice_from_regular(d["lat"], d["lon"], d[k]).astype(np.float32)
                 for k in d if k not in ("lat", "lon")}
@@ -195,7 +204,14 @@ def build_wind(model, run, out_dir, get, sleep):
     try:
         try:
             futures = [ex.submit(one, fh) for fh in steps]
-            per = [f.result() for f in futures]
+            per = []
+            for f in futures:
+                try:
+                    per.append(f.result(timeout=max(0.0, deadline - clock())))
+                except cf.TimeoutError:
+                    raise _OverBudget()
+                if clock() > deadline:
+                    raise _OverBudget()
         except BaseException:
             ex.shutdown(wait=True, cancel_futures=True)
             raise
@@ -204,10 +220,13 @@ def build_wind(model, run, out_dir, get, sleep):
         total = wind.write_wind(out_dir, run, [base + s for s in steps], per)
         groups = len(list((Path(out_dir) / wind_path(run)).glob("*.icw")))
     except Exception as e:
-        print(f"::warning::wind failed: {type(e).__name__}: {e}")
+        if isinstance(e, _OverBudget):
+            print(f"::warning::wind: over budget ({clock() - t0:.0f} s), dropped")
+        else:
+            print(f"::warning::wind failed: {type(e).__name__}: {e}")
         shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
         return None
-    print(f"wind: {groups} groups, {len(steps)} steps, {total / 1e6:.1f} MB, {time.monotonic() - t0:.0f} s")
+    print(f"wind: {groups} groups, {len(steps)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
     return wind.manifest_entry(run)
 
 

@@ -124,3 +124,19 @@ def test_manifest_has_wind_only_when_built(monkeypatch, tmp_path):
             assert man["wind"]["format"] == "ICW1" and (out / "wind/2026110800").is_dir()
         else:
             assert not (out / "wind").exists()
+
+
+def test_build_wind_over_budget_drops_key(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(gb, "read_wind_step", _fake_wind)
+    now = [0.0]
+
+    def get(url, rng=None):
+        now[0] += 400.0                      # every index read costs 400 s
+        return b""
+
+    m = dataclasses.replace(_small(GFS, (0, 6, 12, 18)), workers=1)
+    assert gb.build_wind(m, RUN, tmp_path, get, lambda s: None, budget_s=600, clock=lambda: now[0]) is None
+    assert not (tmp_path / "wind").exists()
+    assert "::warning::wind: over budget" in capsys.readouterr().out
+    now[0] = 0.0
+    assert gb.build_wind(_small(GFS, (0,)), RUN, tmp_path, get, lambda s: None, budget_s=600, clock=lambda: now[0])
