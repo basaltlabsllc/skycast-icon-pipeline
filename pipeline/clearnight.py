@@ -120,6 +120,17 @@ def tile_keys():
     return [tile_name(la, lo) for la in range(-90, 90, TILE_DEG) for lo in range(-180, 180, TILE_DEG)]
 
 
+def tiles_for_squares(names):
+    """The 20° tiles holding these 5° squares, in tile_keys order (a test or
+    partial build makes only those; a full build's squares give all 162)."""
+    from .squares import parse_name
+    want = set()
+    for n in names:
+        la, lo = parse_name(n)
+        want.add(tile_name(la - (la + 90) % TILE_DEG, lo - (lo + 180) % TILE_DEG))
+    return [k for k in tile_keys() if k in want]
+
+
 def _parse(key):
     lat = int(key[1:3]) * (1 if key[0] == "N" else -1)
     lon = int(key[4:7]) * (1 if key[3] == "E" else -1)

@@ -5,6 +5,16 @@ from pipeline.site import build_manifest, ATTRIBUTION
 UTC = dt.timezone.utc
 
 
+def test_manifest_carries_clear_night_only_when_given():
+    run = dt.datetime(2026, 11, 17, 12, tzinfo=UTC)
+    plain = json.loads(build_manifest(run, run, [1, 2], ["N40W125"], 0))
+    assert "clearNight" not in plain
+    cn = {"format": "CLN1", "tiles": "clearnight/2026111712", "nights": ["2026-11-17"]}
+    m = json.loads(build_manifest(run, run, [1, 2], ["N40W125"], 0, clear_night=cn))
+    assert m["clearNight"] == cn
+    assert {k: v for k, v in m.items() if k != "clearNight"} == plain
+
+
 def test_manifest_shape():
     run = dt.datetime(2026, 9, 27, 0, tzinfo=UTC)
     built = dt.datetime(2026, 9, 27, 3, 5, tzinfo=UTC)

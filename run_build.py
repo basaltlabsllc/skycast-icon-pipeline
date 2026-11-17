@@ -21,7 +21,7 @@ from collections import namedtuple
 from pathlib import Path
 import numpy as np
 
-from pipeline import blocks, columns, dwd, history, live, pack, published, site, thick
+from pipeline import blocks, clearnight, columns, dwd, history, live, pack, published, site, thick
 from pipeline.encode import encode_square, quantize, FIELD_COUNT
 from pipeline.regrid import ensure_kit, regrid, lattice_levels, regrid_values
 from pipeline.squares import all_squares, parse_name, slice_square, NX, NY
@@ -224,7 +224,8 @@ def build(site, state, work, deps, pages_base, steps=None, squares=None, workers
     blob.mkdir(parents=True, exist_ok=True)
     block_bytes = write_blocks(blob, run, names, stacks, hours)
     print(f"blocks: {len(names)} squares, {block_bytes / 1e6:.0f} MB")
-    stacks.clear()                       # ~2.5 GB of cloud arrays back before the columns
+    clear_night = build_clear_night(blob, run, names, stacks)
+    stacks.clear()                      # ~2.5 GB of cloud arrays back before the columns
     past.clear()
     # Pages carries none of the columns, blocks or thickness, so its manifest names none.
     (site / "manifest.json").write_text(site_manifest(run, deps.now(), hours, names, n_past, full, tail, None,
@@ -234,7 +235,8 @@ def build(site, state, work, deps, pages_base, steps=None, squares=None, workers
     cols = build_columns(blob, state, work, deps, kit, run, steps, names, workers)
     feed = json.loads(site_manifest(run, deps.now(), hours, names, n_past, full, tail, cols,
                                     blocks=site_blocks(run), thick=thickness, repairs=repairs,
-                                    history_runs=hist_runs, history_since_ms=hist_since))
+                                    history_runs=hist_runs, history_since_ms=hist_since,
+                                    clear_night=clear_night))
     # Blob's manifest alone names the packs (Pages has none of them).
     feed = pack.add_pack_keys(feed, build_packs(site, blob, run, tail, thickness, cols),
                               tile_files=pack.tile_files_on())
@@ -288,9 +290,33 @@ def site_blocks(run):
 
 
 def site_manifest(run, built, hours, names, history_steps, complete, tail=None, columns=None,
-                  blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None):
+                  blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None, clear_night=None):
     return site.build_manifest(run, built, hours, names, history_steps, complete, tail, columns, blocks, thick,
-                               repairs, history_runs=history_runs, history_since_ms=history_since_ms)
+                               repairs, history_runs=history_runs, history_since_ms=history_since_ms,
+                               clear_night=clear_night)
+
+
+def build_clear_night(blob_dir, run, names, stacks):
+    """SkyCast's Clear Night map (pipeline/clearnight.py): each night's total
+    cover over its astronomically dark hours, as 20° CLN1 tiles under
+    clearnight/<run>/ on Blob, from the same hours as the squares (history
+    first). Returns the manifest's `clearNight` entry, or None; a failure here
+    never fails the build — the map then has no Clear Night until the next run."""
+    t0 = time.monotonic()
+    ci = dwd.FIELDS.index("CLCT")
+    try:
+        entry = clearnight.build_clearnight(blob_dir, dwd.run_id(run), [h for h, _ in stacks],
+                                            lambda i: stacks[i][1][ci], keys=clearnight.tiles_for_squares(names))
+    except Exception as e:
+        print(f"::warning::clear night failed: {type(e).__name__}: {e}")
+        shutil.rmtree(Path(blob_dir) / "clearnight", ignore_errors=True)
+        return None
+    if entry is None:
+        print("::warning::clear night: no night has data")
+        return None
+    print(f"clear night: {len(entry['nights'])} nights × {len(entry['keys'])} tiles, "
+          f"{sum(entry['bytes'].values()) / 1e6:.2f} MB, {time.monotonic() - t0:.0f} s")
+    return entry
 
 
 def write_blocks(blob_dir, run, names, stacks, hours):

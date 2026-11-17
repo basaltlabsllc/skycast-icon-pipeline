@@ -86,6 +86,11 @@ def test_slice_tile_is_161_and_wraps_the_dateline():
     assert slice_tile(world, -90, -180)[0, 0] == world[0, 0]
 
 
+def test_tiles_for_squares_are_the_covering_20_degree_tiles():
+    from pipeline.clearnight import tiles_for_squares
+    assert tiles_for_squares(["N40W125", "N45W120", "N25W100"]) == ["N10W100", "N30W140", "N30W120"]
+
+
 def test_tile_roundtrip():
     layers = np.random.default_rng(1).integers(0, 256, (4, TILE_SIDE, TILE_SIDE), dtype=np.uint8)
     blob = encode_tile(40, -140, "2026-11-17", layers)

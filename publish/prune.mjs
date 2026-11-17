@@ -3,8 +3,9 @@
 // The feed's blob store holds manifest.json plus one folder per run (tiles/<run>/),
 // per block file set (blocks/<run>/), per tail (tail/<run>/), per column feed
 // (columns/<run>/), per thickness feed (thick/<run>/) and per fog feed
-// (fog/<run>/) and per wind lattice (wind/<run>/, ICW1); each may hold its
-// pack (<folder>/pack-<h>/, PACK1 named by its content; the fog's ICCP1 at fog/<run>/pack/). A publish keeps the folders the NEW manifest names and the ones
+// (fog/<run>/), per wind lattice (wind/<run>/, ICW1) and per Clear Night set
+// (clearnight/<run>/, CLN1); each may hold its pack (<folder>/pack-<h>/, PACK1
+// named by its content; the fog's ICCP1 at fog/<run>/pack/). A publish keeps the folders the NEW manifest names and the ones
 // the PREVIOUS manifest named — a phone that read the old manifest a moment ago
 // is still fetching its squares — and deletes every other folder.
 
@@ -15,7 +16,7 @@ export function manifestFolders(m) {
   for (const k of ['tiles', 'blocks']) {
     if (m && typeof m[k] === 'string' && m[k]) out.push(m[k].replace(/\/?$/, '/'));
   }
-  for (const k of ['tail', 'columns', 'thick', 'wind', 'fog']) {
+  for (const k of ['tail', 'columns', 'thick', 'wind', 'fog', 'clearNight']) {
     if (m && m[k] && typeof m[k].tiles === 'string' && m[k].tiles) out.push(m[k].tiles.replace(/\/?$/, '/'));
   }
   // The fog packs (fog/<run>/pack/, ICCP1): with FOG_TILE_FILES=0 the entry
@@ -30,7 +31,7 @@ export function manifestFolders(m) {
   for (const k of ['tilesPack', 'blocksPack']) {
     if (m && typeof m[k] === 'string' && m[k]) out.push(m[k].replace(/\/?$/, '/'));
   }
-  for (const k of ['tail', 'columns', 'thick', 'wind']) {
+  for (const k of ['tail', 'columns', 'thick', 'wind', 'clearNight']) {
     if (m && m[k] && typeof m[k].pack === 'string' && m[k].pack) out.push(m[k].pack.replace(/\/?$/, '/'));
   }
   return out;

@@ -11,6 +11,13 @@ test('the folders a manifest names', () => {
   assert.deepEqual(manifestFolders(null), []);
 });
 
+test('the Clear Night tiles a manifest names are kept', () => {
+  const m = { tiles: 'tiles/2026111712', clearNight: { format: 'CLN1', tiles: 'clearnight/2026111712' } };
+  assert.deepEqual(manifestFolders(m), ['tiles/2026111712/', 'clearnight/2026111712/']);
+  assert.deepEqual(pathsToDelete(['clearnight/2026111712/2026-11-17/N30W140.cln', 'clearnight/2026111700/2026-11-17/N30W140.cln'],
+    { current: m, previous: null }), ['clearnight/2026111700/2026-11-17/N30W140.cln']);
+});
+
 test('keeps the manifest, the current run and the previous one; deletes older runs', () => {
   const paths = [
     'manifest.json',

@@ -74,6 +74,33 @@ def _fake_deps(tmp_path, world_value=lambda step, field: 0, prev_manifest=None,
 WHOLE = {"columns": {"x": 1}, "thick": {"x": 1}, "blocks": "blocks/x", "tail": {"x": 1}}
 
 
+def _clear_build(tmp_path):
+    deps, _ = _fake_deps(tmp_path, world_value=lambda s, f: 10)
+    rc = run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
+                         deps=deps, pages_base=None, steps=list(range(0, 79)), squares=["N40W125"])
+    return rc, tmp_path / "site", tmp_path / "blob"
+
+
+def test_clear_night_goes_to_blob_and_the_blob_manifest_names_it(tmp_path):
+    rc, site, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
+    assert cn["format"] == "CLN1" and cn["tiles"] == "clearnight/2026092700" and cn["keys"] == ["N30W140"]
+    assert cn["nights"] and (blob / cn["tiles"] / cn["nights"][0] / "N30W140.cln").exists()
+    assert "clearNight" not in json.loads((site / "manifest.json").read_text())
+    assert not (site / "clearnight").exists()
+
+
+def test_a_failed_clear_night_never_fails_the_build(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(run_build.clearnight, "build_clearnight", boom)
+    rc, _, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    assert "clearNight" not in json.loads((blob / "manifest.json").read_text())
+    assert not (blob / "clearnight").exists()
+
+
 def test_early_exit_when_the_site_already_has_this_run(tmp_path, capsys):
     deps, calls = _fake_deps(tmp_path, prev_manifest={"run": "2026-09-27T00Z", "complete": True, **WHOLE})
     rc = run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
