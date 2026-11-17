@@ -50,7 +50,7 @@ export function putOptionsFor(path, size) {
 // files still go up. The HRRR fog entry has its own switch and is not touched.
 
 const TOP_PACKS = [['tiles', 'tilesPack'], ['blocks', 'blocksPack']];
-const ENTRY_PACKS = ['tail', 'thick', 'columns', 'wind'];
+const ENTRY_PACKS = ['tail', 'thick', 'columns', 'wind', 'clearNight'];
 const slash = (p) => p.replace(/\/?$/, '/');
 
 /** [[runFolder/, runFolder/pack/]] for each folder the manifest names only by its pack. */

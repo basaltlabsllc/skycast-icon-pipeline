@@ -9,7 +9,7 @@ covers are MISSING, so tiles past the fetched box read no data.
 
 Usage: python3 tools/clearnight_from_feed.py <feedDir> <outDir>
 Writes <outDir>/manifest.json ({"clearNight": entry, "run": …}) and
-<outDir>/clearnight/<run>/<night>/<key>.cln; prints compute time and bytes.
+<outDir>/clearnight/<run>/<night>_<key>.cln; prints compute time and bytes.
 """
 import datetime as dt
 import json

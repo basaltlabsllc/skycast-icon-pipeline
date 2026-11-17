@@ -119,7 +119,11 @@ def test_build_clearnight_writes_listed_nights(tmp_path):
     entry = build_clearnight(tmp_path, "2026111712", hours, lambda i: world)
     assert entry["format"] == "CLN1" and entry["tiles"] == "clearnight/2026111712"
     assert "2026-11-17" in entry["nights"]
-    f = tmp_path / "clearnight" / "2026111712" / "2026-11-17" / "N30W140.cln"
+    # Flat, <night>_<key>.cln, so pipeline/pack.py (which packs the files
+    # directly in a folder) puts every night in the one pack.
+    run_dir = tmp_path / "clearnight" / "2026111712"
+    assert not [p for p in run_dir.iterdir() if p.is_dir()]
+    f = run_dir / "2026-11-17_N30W140.cln"
     d = decode_tile(f.read_bytes())
     # Bend sits at row (44.058-30)/0.125 ≈ 112, col (−121.315+140)/0.125 ≈ 149.
     mean, mx, clear, dark = d["layers"][:, 112, 149]

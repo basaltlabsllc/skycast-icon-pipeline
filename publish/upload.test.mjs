@@ -91,3 +91,10 @@ test('blob.mjs uploads run-folder files through putOptionsFor with the body size
   const src = await readFile(new URL('./blob.mjs', import.meta.url), 'utf8');
   assert.match(src, /put\(path, body, putOptionsFor\(path, body\.length\)\)/);
 });
+
+test('Clear Night named only by its pack: its per-file copies are never uploaded', () => {
+  const m = { clearNight: { format: 'CLN1', pack: 'clearnight/2026111712/pack-0123456789ab' } };
+  assert.deepEqual(packedOnlyFolders(m), [['clearnight/2026111712/', 'clearnight/2026111712/pack-0123456789ab/']]);
+  const files = [{ path: 'clearnight/2026111712/2026-11-17/N30W140.cln' }, { path: 'clearnight/2026111712/pack-0123456789ab/all.bin' }, { path: 'clearnight/2026111712/pack-0123456789ab/index.json' }];
+  assert.deepEqual(splitPacked(files, m).send.map((f) => f.path), ['clearnight/2026111712/pack-0123456789ab/all.bin', 'clearnight/2026111712/pack-0123456789ab/index.json']);
+});

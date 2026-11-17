@@ -159,6 +159,15 @@ test('with keepHours, runs begun within it keep their clouds, thickness and run 
   ]);
 });
 
+test('Clear Night packed only: the pack folder of the current and previous runs is kept, older runs go', () => {
+  const c = { tiles: 'tiles/B', clearNight: { format: 'CLN1', pack: 'clearnight/B/pack-0123456789ab' } };
+  const p = { tiles: 'tiles/A', clearNight: { format: 'CLN1', pack: 'clearnight/A/pack-ba9876543210' } };
+  assert.deepEqual(manifestFolders(c), ['tiles/B/', 'clearnight/B/pack-0123456789ab/']);
+  const paths = ['clearnight/B/pack-0123456789ab/all.bin', 'clearnight/B/pack-0123456789ab/index.json',
+    'clearnight/A/pack-ba9876543210/all.bin', 'clearnight/Z/pack-aaaaaaaaaaaa/all.bin', 'clearnight/Z/2026-11-17/N30W140.cln'];
+  assert.deepEqual(pathsToDelete(paths, { current: c, previous: p }), ['clearnight/Z/pack-aaaaaaaaaaaa/all.bin', 'clearnight/Z/2026-11-17/N30W140.cln']);
+});
+
 test('fog packs: an entry with only `pack` (FOG_TILE_FILES=0) keeps its pack folder for current and previous', () => {
   assert.deepEqual(manifestFolders({ fog: { pack: 'fog/2026111012/pack' } }), ['fog/2026111012/pack/']);
   const c = { tiles: 'tiles/B', fog: { pack: 'fog/B/pack' } }, p = { tiles: 'tiles/A', fog: { pack: 'fog/A/pack' } };

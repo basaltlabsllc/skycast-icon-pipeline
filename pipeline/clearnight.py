@@ -196,8 +196,15 @@ def path(run_id):
     return f"clearnight/{run_id}"
 
 
+def file_name(night, key):
+    """A tile's file in its run folder: flat, so pipeline/pack.py's one pack
+    (the files directly in the folder) holds every night. SkyCast's
+    src/clearnightload.js reads the same name."""
+    return f"{night}_{key}.cln"
+
+
 def build_clearnight(out_dir, run_id, hours, cover_world, keys=None, first_night=None):
-    """Every listed night's tiles under out_dir/clearnight/<run_id>/<night>/;
+    """Every listed night's tiles under out_dir/clearnight/<run_id>/ (file_name);
     cover_world(i) → the CLCT world [NY][NX] (u8) of hours[i]. A night is
     listed when at least one node has data; nights before first_night
     ('YYYY-MM-DD', the run's UTC date − 1: the oldest any zone can still call
@@ -224,10 +231,9 @@ def build_clearnight(out_dir, run_id, hours, cover_world, keys=None, first_night
             files[k] = encode_tile(la, lo, night, layers)
         if not any_data:
             continue
-        d = root / night
-        d.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True)
         for k, b in files.items():
-            (d / f"{k}.cln").write_bytes(b)
+            (root / file_name(night, k)).write_bytes(b)
         nights.append(night)
         sizes[night] = sum(len(b) for b in files.values())
     if not nights:

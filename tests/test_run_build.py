@@ -81,12 +81,34 @@ def _clear_build(tmp_path):
     return rc, tmp_path / "site", tmp_path / "blob"
 
 
-def test_clear_night_goes_to_blob_and_the_blob_manifest_names_it(tmp_path):
+def _blob_files(blob, rel):
+    root = blob / rel
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def test_clear_night_goes_to_blob_as_one_pack_and_the_blob_manifest_names_only_it(tmp_path):
     rc, site, blob = _clear_build(tmp_path)
     assert rc == run_build.BUILT
     cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
-    assert cn["format"] == "CLN1" and cn["tiles"] == "clearnight/2026092700" and cn["keys"] == ["N30W140"]
-    assert cn["nights"] and (blob / cn["tiles"] / cn["nights"][0] / "N30W140.cln").exists()
+    assert cn["format"] == "CLN1" and cn["keys"] == ["N30W140"] and cn["nights"]
+    assert "tiles" not in cn
+    assert cn["pack"].startswith("clearnight/2026092700/pack-")
+    # Two Blob puts a run: the pack and its index; the per-file tiles are gone.
+    name = cn["pack"].rsplit("/", 1)[1]
+    assert _blob_files(blob, "clearnight/2026092700") == [f"{name}/all.bin", f"{name}/index.json"]
+    idx = json.loads((blob / cn["pack"] / "index.json").read_text())
+    assert f"{cn['nights'][0]}_N30W140.cln" in idx["names"]
+    assert len(idx["names"]) == len(cn["nights"]) * len(cn["keys"])
+
+
+def test_a_clear_night_pack_that_fails_falls_back_to_the_per_file_tiles(tmp_path, monkeypatch):
+    real = run_build.pack.try_pack
+    monkeypatch.setattr(run_build.pack, "try_pack", lambda root, rel, *a, **k: None if rel.startswith("clearnight/") else real(root, rel, *a, **k))
+    rc, site, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
+    assert cn["tiles"] == "clearnight/2026092700" and "pack" not in cn
+    assert (blob / cn["tiles"] / f"{cn['nights'][0]}_N30W140.cln").exists()
     assert "clearNight" not in json.loads((site / "manifest.json").read_text())
     assert not (site / "clearnight").exists()
 

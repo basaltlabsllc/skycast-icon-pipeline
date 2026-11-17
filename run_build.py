@@ -315,6 +315,18 @@ def build_clear_night(blob_dir, run, names, stacks):
     if entry is None:
         print("::warning::clear night: no night has data")
         return None
+    # Pack-only on Blob: one pack (all.bin + index.json, 2 puts) instead of a
+    # file per tile and night (~1,000). The per-file tiles are deleted once
+    # packed, so the publish never sees them. A pack that fails (try_pack:
+    # a ::warning:: and None) leaves the files and the `tiles` key: this run
+    # goes up per file, as before packs.
+    got = pack.try_pack(blob_dir, entry["tiles"])
+    if got:
+        run_dir, keep = Path(blob_dir) / entry["tiles"], got.rsplit("/", 1)[1]
+        for child in run_dir.iterdir():
+            if child.name != keep:
+                shutil.rmtree(child) if child.is_dir() else child.unlink()
+        entry = {**{k: v for k, v in entry.items() if k != "tiles"}, "pack": got}
     print(f"clear night: {len(entry['nights'])} nights × {len(entry['keys'])} tiles, "
           f"{sum(entry['bytes'].values()) / 1e6:.2f} MB, {time.monotonic() - t0:.0f} s")
     return entry
