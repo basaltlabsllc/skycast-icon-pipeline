@@ -14,7 +14,7 @@
 #                          20 degree groups (pipeline/wind.py), over main + tail
 #                          steps, for models with wind=True. A failure drops the
 #                          wind key and files; the cover is published anyway.
-#   <folder>/<run>/pack/   PACK1 (pipeline/pack.py): each folder above as one
+#   <folder>/<run>/pack-<h>/ PACK1 (pipeline/pack.py): each folder above as one
 #                          all.bin + index.json; the manifest names it beside
 #                          the folder (tilesPack, blocksPack, tail/thick/wind
 #                          .pack). FEED_TILE_FILES=0 drops the per-file keys of

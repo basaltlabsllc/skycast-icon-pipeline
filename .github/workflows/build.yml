@@ -66,7 +66,7 @@ jobs:
         id: build
         env:
           PYTHONUNBUFFERED: "1"
-          # pipeline/pack.py: "1" names the per-file folders AND the packs (blob/<kind>/<run>/pack/) in Blob's manifest, so both go up; "0" names only the packs once the app that reads them is out. Pages never changes.
+          # pipeline/pack.py: "1" names the per-file folders AND the packs (blob/<kind>/<run>/pack-<sha256[:12]>/) in Blob's manifest, so both go up; "0" names only the packs once the app that reads them is out. Pages never changes.
           FEED_TILE_FILES: "1"
         run: |
           PAGES_BASE="https://$(echo "${GITHUB_REPOSITORY}" | cut -d/ -f1).github.io/$(echo "${GITHUB_REPOSITORY}" | cut -d/ -f2)"

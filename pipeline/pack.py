@@ -83,10 +83,42 @@ def pack_folder(root, rel, dest=None):
     return f"{rel}/{name}"
 
 
-def try_pack(root, rel, dest=None):
+# A pack is skipped (no key, the per-file copies stay) when it would be bigger
+# than node's readFile can hold (2 GiB; publish/blob.mjs reads each file whole)
+# or would leave the runner less than MIN_FREE_BYTES of disk: an ENOSPC in a
+# later step (publish state) fails the job, which a missing pack never does.
+MAX_PACK_BYTES = int(1.9 * 2**30)
+MIN_FREE_BYTES = 3 * 10**9
+
+
+def folder_bytes(folder):
+    folder = Path(folder)
+    if not folder.is_dir():
+        return 0
+    return sum(f.stat().st_size for f in folder.iterdir() if f.is_file())
+
+
+def pack_skip_reason(root, rel, dest=None, free=None):
+    """Why this folder must not be packed, or None."""
+    size = folder_bytes(Path(root) / rel)
+    if size > MAX_PACK_BYTES:
+        return f"{size / 2**30:.2f} GiB is over the {MAX_PACK_BYTES / 2**30:.1f} GiB a publish can read"
+    out = Path(dest if dest is not None else root)
+    out.mkdir(parents=True, exist_ok=True)
+    left = (shutil.disk_usage(out).free if free is None else free) - size
+    if left < MIN_FREE_BYTES:
+        return f"would leave {left / 1e9:.1f} GB free on the runner (minimum {MIN_FREE_BYTES / 1e9:.0f} GB)"
+    return None
+
+
+def try_pack(root, rel, dest=None, free=None):
     """pack_folder, but a failure is a ::warning:: and None (the partial pack is
     removed): a failed pack drops its manifest key, never the build."""
     try:
+        why = pack_skip_reason(root, rel, dest, free)
+        if why:
+            print(f"::warning::pack {rel} skipped: {why}")
+            return None
         got = pack_folder(root, rel, dest)
     except Exception as e:
         print(f"::warning::pack {rel} failed: {type(e).__name__}: {e}")

@@ -145,3 +145,19 @@ def test_live_counts_a_pack_only_blob_manifest_as_whole():
     assert live.live_status(lambda url: json.dumps(m), None, blob_base="https://b") == ("R", True, 0)
     m2 = {k: v for k, v in m.items() if k != "blocksPack"}
     assert live.live_status(lambda url: json.dumps(m2), None, blob_base="https://b")[1] is False
+
+
+def test_a_pack_too_big_or_too_short_of_disk_is_skipped(tmp_path, monkeypatch, capsys):
+    d = tmp_path / "tiles" / "R"
+    d.mkdir(parents=True)
+    (d / "N40W125.icl").write_bytes(b"x" * 100)
+    # too little disk: no pack, no folder, a warning
+    assert pack.try_pack(tmp_path, "tiles/R", free=pack.MIN_FREE_BYTES + 50) is None
+    assert not [p for p in d.iterdir() if p.is_dir()]
+    assert "skipped" in capsys.readouterr().out
+    # too big for node's readFile
+    monkeypatch.setattr(pack, "MAX_PACK_BYTES", 99)
+    assert pack.try_pack(tmp_path, "tiles/R", free=10**12) is None
+    monkeypatch.setattr(pack, "MAX_PACK_BYTES", 10**9)
+    # room enough: packed
+    assert pack.try_pack(tmp_path, "tiles/R", free=10**12).startswith("tiles/R/pack-")
