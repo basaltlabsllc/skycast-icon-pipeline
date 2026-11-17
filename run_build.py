@@ -306,7 +306,8 @@ def build_clear_night(blob_dir, run, names, stacks):
     ci = dwd.FIELDS.index("CLCT")
     try:
         entry = clearnight.build_clearnight(blob_dir, dwd.run_id(run), [h for h, _ in stacks],
-                                            lambda i: stacks[i][1][ci], keys=clearnight.tiles_for_squares(names))
+                                            lambda i: stacks[i][1][ci], keys=clearnight.tiles_for_squares(names),
+                                            first_night=(run - dt.timedelta(days=1)).date().isoformat())
     except Exception as e:
         print(f"::warning::clear night failed: {type(e).__name__}: {e}")
         shutil.rmtree(Path(blob_dir) / "clearnight", ignore_errors=True)

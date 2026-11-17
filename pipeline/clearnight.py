@@ -196,10 +196,12 @@ def path(run_id):
     return f"clearnight/{run_id}"
 
 
-def build_clearnight(out_dir, run_id, hours, cover_world, keys=None):
+def build_clearnight(out_dir, run_id, hours, cover_world, keys=None, first_night=None):
     """Every listed night's tiles under out_dir/clearnight/<run_id>/<night>/;
     cover_world(i) → the CLCT world [NY][NX] (u8) of hours[i]. A night is
-    listed when at least one node has data. Returns the manifest entry."""
+    listed when at least one node has data; nights before first_night
+    ('YYYY-MM-DD', the run's UTC date − 1: the oldest any zone can still call
+    tonight) are left out. Returns the manifest entry."""
     keys = list(keys) if keys is not None else tile_keys()
     hours = [int(h) for h in hours]
     root = Path(out_dir) / path(run_id)
@@ -211,6 +213,8 @@ def build_clearnight(out_dir, run_id, hours, cover_world, keys=None):
             cubes[k][i] = slice_tile(w, *_parse(k))
     nights, sizes = [], {}
     for night in nights_for(hours):
+        if first_night and night < first_night:
+            continue
         files, any_data = {}, False
         for k in keys:
             la, lo = _parse(k)

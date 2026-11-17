@@ -86,6 +86,15 @@ def test_slice_tile_is_161_and_wraps_the_dateline():
     assert slice_tile(world, -90, -180)[0, 0] == world[0, 0]
 
 
+def test_build_clearnight_skips_nights_before_first_night(tmp_path):
+    hours = list(range(int(uh(2026, 11, 15, 0)), int(uh(2026, 11, 19, 0)) + 1))
+    world = np.full((NY, NX), 30, dtype=np.uint8)
+    entry = build_clearnight(tmp_path, "2026111712", hours, lambda i: world, keys=["N30W140"],
+                             first_night="2026-11-16")
+    assert entry["nights"][0] == "2026-11-16"
+    assert not (tmp_path / "clearnight" / "2026111712" / "2026-11-15").exists()
+
+
 def test_tiles_for_squares_are_the_covering_20_degree_tiles():
     from pipeline.clearnight import tiles_for_squares
     assert tiles_for_squares(["N40W125", "N45W120", "N25W100"]) == ["N10W100", "N30W140", "N30W120"]
