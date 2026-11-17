@@ -151,3 +151,27 @@ def missing_column_files(listing, run, steps):
         html = listing(hh, field) or ""
         missing += [n for n in names if n not in html]
     return missing
+
+
+# ---- The wind (ICW1, pipeline/wind.py) --------------------------------------
+# u and v at 850, 500 and 250 hPa (the app's low, mid and high deck), from the
+# pressure-level files under grib/<HH>/u/ and grib/<HH>/v/. Like the thickness
+# they never decide whether a run is complete: a missing wind must not hold
+# back the cover.
+WIND_LEVELS = (850, 500, 250)
+
+
+def wind_files(run, steps):
+    """{"U": [names], "V": [names]} — every file one wind build reads, step by
+    step, the three levels of each."""
+    return {f: [pressure_file_name(run, s, lv, f) for s in steps for lv in WIND_LEVELS] for f in ("U", "V")}
+
+
+def missing_wind_files(listing, run, steps):
+    """`listing(hh, field) -> html`. The wind files of `run` not listed yet."""
+    hh = f"{run:%H}"
+    missing = []
+    for field, names in wind_files(run, steps).items():
+        html = listing(hh, field) or ""
+        missing += [n for n in names if n not in html]
+    return missing

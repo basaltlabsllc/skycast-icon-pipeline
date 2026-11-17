@@ -36,7 +36,7 @@ def wind_path(run):
 
 def build_manifest(run, built, step_hours, squares, history_hours, complete=True, tail=None, columns=None,
                    blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None,
-                   clear_night=None):
+                   clear_night=None, wind=None):
     out = {
         "run": run_iso(run),
         # False for a test build (some steps, some squares). Only a complete
@@ -88,4 +88,8 @@ def build_manifest(run, built, step_hours, squares, history_hours, complete=True
     # absent otherwise; older readers ignore the key.
     if clear_night is not None:
         out["clearNight"] = clear_night
+    # The wind (ICW1, pipeline/wind.manifest_entry), only when it was built;
+    # the key is absent otherwise. Blob only. See run_build.build_wind.
+    if wind:
+        out["wind"] = wind
     return json.dumps(out, separators=(",", ":"))

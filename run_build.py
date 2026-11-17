@@ -21,10 +21,10 @@ from collections import namedtuple
 from pathlib import Path
 import numpy as np
 
-from pipeline import blocks, clearnight, columns, dwd, history, live, pack, published, site, thick
+from pipeline import blocks, clearnight, columns, dwd, history, live, pack, published, site, thick, wind
 from pipeline.encode import encode_square, quantize, FIELD_COUNT
 from pipeline.regrid import ensure_kit, regrid, lattice_levels, regrid_values
-from pipeline.squares import all_squares, parse_name, slice_square, NX, NY
+from pipeline.squares import all_squares, parse_name, slice_square, NX, NY, DEG
 
 BUILT, NOTHING_TO_DO, FAILED = 0, 3, 1
 ROOT = Path(__file__).resolve().parent
@@ -232,20 +232,21 @@ def build(site, state, work, deps, pages_base, steps=None, squares=None, workers
                                                       repairs=repairs, history_runs=hist_runs,
                                                       history_since_ms=hist_since))
     thickness = build_thick(blob, state, work, deps, kit, run, steps, names, workers, hours)
+    wind_entry = build_wind(blob, work, deps, kit, run, steps, workers)
     cols = build_columns(blob, state, work, deps, kit, run, steps, names, workers)
     feed = json.loads(site_manifest(run, deps.now(), hours, names, n_past, full, tail, cols,
                                     blocks=site_blocks(run), thick=thickness, repairs=repairs,
                                     history_runs=hist_runs, history_since_ms=hist_since,
-                                    clear_night=clear_night))
+                                    clear_night=clear_night, wind=wind_entry))
     # Blob's manifest alone names the packs (Pages has none of them).
-    feed = pack.add_pack_keys(feed, build_packs(site, blob, run, tail, thickness, cols),
+    feed = pack.add_pack_keys(feed, build_packs(site, blob, run, tail, thickness, cols, wind_entry),
                               tile_files=pack.tile_files_on())
     (blob / "manifest.json").write_text(json.dumps(feed, separators=(",", ":")))
     print(f"built {len(names)} squares, {len(hours)} steps ({n_past} history)")
     return BUILT
 
 
-def build_packs(site_dir, blob_dir, run, tail, thickness, cols):
+def build_packs(site_dir, blob_dir, run, tail, thickness, cols, wind_entry=None):
     """One PACK1 pack per per-square folder (pipeline/pack.py), every one
     written into blob_dir at the folder's own path: the squares and the tail
     are read from site_dir (Pages carries them per file, and never a pack), the
@@ -258,6 +259,7 @@ def build_packs(site_dir, blob_dir, run, tail, thickness, cols):
         "blocks": pack.try_pack(blob_dir, site_blocks(run)),
         "thick": pack.try_pack(blob_dir, thickness["tiles"]) if thickness else None,
         "columns": pack.try_pack(blob_dir, cols["tiles"]) if cols else None,
+        "wind": pack.try_pack(blob_dir, wind_entry["tiles"]) if wind_entry else None,
     }
 
 
@@ -290,10 +292,11 @@ def site_blocks(run):
 
 
 def site_manifest(run, built, hours, names, history_steps, complete, tail=None, columns=None,
-                  blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None, clear_night=None):
+                  blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None, clear_night=None,
+                  wind=None):
     return site.build_manifest(run, built, hours, names, history_steps, complete, tail, columns, blocks, thick,
                                repairs, history_runs=history_runs, history_since_ms=history_since_ms,
-                               clear_night=clear_night)
+                               clear_night=clear_night, wind=wind)
 
 
 def build_clear_night(blob_dir, run, names, stacks):
@@ -472,6 +475,91 @@ def build_thick(blob_dir, state, work, deps, kit, run, steps, names, workers, ho
           f"{total / 1e6:.1f} MB, {time.monotonic() - t0:.0f} s")
     return {"format": "ICT1", "run": dwd.run_iso(run), "runMs": int(run.timestamp() * 1000),
             "tiles": site_thick(run)}
+
+
+# ---- The wind (ICW1, pipeline/wind.py) ----------------------------------------
+# u and v at 850/500/250 hPa for the app's cloud drift. Like the thickness it
+# never decides whether the run goes out: wait this long for the files, then
+# publish without wind. ICON's regridded U/V are already east/north, so no
+# rotation is needed.
+WIND_WAIT_S = 10 * 60
+WIND_BUDGET_S = 15 * 60     # a full run projects to 4-6 min (see build_wind)
+_WIND_COMPS = {"U": "u", "V": "v"}
+
+
+class _WindOverBudget(Exception):
+    pass
+
+
+def _regular_axes():
+    return (-90.0 + DEG * np.arange(NY), -180.0 + DEG * np.arange(NX))
+
+
+def build_wind(blob_dir, work, deps, kit, run, steps, workers, budget_s=None, clock=time.monotonic):
+    """wind/<run>/<group>.icw (ICW1) over `steps`, the same steps the cover
+    and the thickness use; returns the manifest's `wind` entry, or None.
+
+    Any failure, or more than `budget_s` seconds (default WIND_BUDGET_S, counted
+    from when the files are all listed), removes wind/ and returns None: the
+    cover goes out without wind. The budget exists because the ICON workflow
+    has a 150-minute job timeout and nothing inside it: wind runs after the
+    cover, the thickness and the tail but before the column feed, so it may
+    spend at most this long and the columns and the publish still fit: the
+    worst case is the three waits (15 + 10 + 15 min) plus the cover (~7 min),
+    this budget (15) and the columns (~13), far inside the 150."""
+    budget_s = WIND_BUDGET_S if budget_s is None else budget_s
+    steps = list(steps)
+    t0 = clock()
+    try:
+        if not _wait_for_files(deps, run, "wind", WIND_WAIT_S,
+                               lambda: dwd.missing_wind_files(deps.listing, run, steps)):
+            return None
+        t0 = clock()
+        deadline = t0 + budget_s
+        lat1d, lon1d = _regular_axes()
+
+        def job(step, level, field):
+            if clock() > deadline:
+                raise _WindOverBudget()
+            name = dwd.pressure_file_name(run, step, level, field)
+            dst = Path(work) / name
+            try:
+                deps.download(dwd.dir_url(run, field, name), dst)
+                world = deps.regrid_values(dst, kit, work)
+                return step, level, _WIND_COMPS[field], wind.lattice_from_regular(lat1d, lon1d, world).astype(np.float32)
+            finally:
+                dst.unlink(missing_ok=True)
+
+        jobs = [(s, lv, f) for s in steps for lv in dwd.WIND_LEVELS for f in _WIND_COMPS]
+        got = {}
+        pool = cf.ThreadPoolExecutor(max_workers=max(1, workers))
+        try:
+            futures = [pool.submit(job, *j) for j in jobs]
+            for fut in futures:
+                try:
+                    step, level, comp, lat = fut.result(timeout=max(0.0, deadline - clock()))
+                except cf.TimeoutError:
+                    raise _WindOverBudget()
+                got[(step, level, comp)] = lat
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        if clock() > deadline:
+            raise _WindOverBudget()
+        per = [{(lv, c): got[(s, lv, c)] for lv in dwd.WIND_LEVELS for c in "uv"} for s in steps]
+        base = history.hour_of(run)
+        total = wind.write_wind(blob_dir, run, [base + s for s in steps], per)
+        groups = len(list((Path(blob_dir) / site.wind_path(run)).glob("*.icw")))
+    except Exception as e:
+        if isinstance(e, _WindOverBudget):
+            print(f"::warning::wind: over budget ({clock() - t0:.0f} s), dropped")
+        else:
+            print(f"::warning::wind failed: {type(e).__name__}: {e}")
+        shutil.rmtree(Path(blob_dir) / "wind", ignore_errors=True)
+        return None
+    print(f"wind: {groups} groups, {len(steps)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
+    return wind.manifest_entry(run)
 
 
 # ---- The column feed (docs/column-feed-design.md) ---------------------------
