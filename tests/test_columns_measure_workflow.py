@@ -66,10 +66,14 @@ def test_heights_runs_the_height_measurement_instead(tmp_path):
     assert run_measure(tmp_path, "heights") == ["tools/measure_heights.py --out /mnt/measure"]
 
 
-def test_the_input_names_its_three_choices():
+def test_heights_build_times_the_builds_own_heights_step(tmp_path):
+    assert run_measure(tmp_path, "heights-build") == ["tools/time_heights.py --out /mnt/measure"]
+
+
+def test_the_input_names_its_four_choices():
     block = TEXT[TEXT.index("inputs:"):TEXT.index("permissions:")]
     assert "default: all" in block
-    for choice in ("all", "interp", "heights"):
+    for choice in ("all", "interp", "heights", "heights-build"):
         assert re.search(rf"\b{choice} =", block), choice
 
 
@@ -81,4 +85,5 @@ def test_read_only_and_dispatch_only():
                  "upload-pages", "deploy-pages", "gh workflow run"):
         assert word not in CODE, word
     assert re.findall(r"python (tools/\S+|-m pytest)", CODE) == ["-m pytest", "tools/measure_heights.py",
+                                                                 "tools/time_heights.py",
                                                                  "tools/measure_columns.py"]

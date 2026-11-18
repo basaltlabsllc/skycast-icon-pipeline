@@ -1134,6 +1134,30 @@ def height_step(deps, kit, work, run, step, stride, window, hhl, masks, threshol
     return heights.height_record(clc, hhl, threshold, masks)
 
 
+# The heights' process printed nothing for its whole 30 min on the runner (run
+# 44221721803), so nobody could say where the time went. It now says how far
+# it is every this many steps: seconds downloading and remapping summed over
+# the threads, and the machine's free memory and load.
+HEIGHTS_PROGRESS_EVERY = 5
+
+
+def _clock_line():
+    with _CLOCK_LOCK:
+        return ", ".join(f"{k} {v:.0f} s" for k, v in sorted(_CLOCK.items())) or "no timers yet"
+
+
+def _machine_line():
+    """Free memory and load, read from /proc (Linux); "" elsewhere. Never raises."""
+    try:
+        mem = {k: int(v.split()[0]) for k, v in (ln.split(":", 1) for ln in Path("/proc/meminfo").read_text().splitlines())
+               if k in ("MemAvailable", "SwapTotal", "SwapFree")}
+        load = Path("/proc/loadavg").read_text().split()[0]
+        return (f"memory free {mem['MemAvailable'] / 1048576:.1f} GB, swap used "
+                f"{(mem['SwapTotal'] - mem['SwapFree']) / 1048576:.1f} GB, load {load}")
+    except Exception:
+        return "machine not read"
+
+
 def fetch_heights(deps, kit, work, run, steps, workers, stride, window, check):
     """[(unix hour, u8 [5][R][C])] in time order. Any file that fails, or
     `check` raising (out of time), fails the whole fetch: the steps not yet
@@ -1147,14 +1171,20 @@ def fetch_heights(deps, kit, work, run, steps, workers, stride, window, check):
 
     threshold = heights.CLC_THRESHOLD_PCT
     base = history.hour_of(run)
+    t0 = time.monotonic()
+    print(f"heights: fetching {len(steps)} steps with {workers} threads ({_machine_line()})")
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         try:
             hhl, masks = height_statics(deps, kit, work, run, stride, window, pool, checked)
+            print(f"heights: statics done at {time.monotonic() - t0:.0f} s ({_clock_line()})")
             futs = {pool.submit(height_step, deps, kit, work, run, s, stride, window, hhl, masks, threshold,
                                 checked): s for s in steps}
             got = {}
             for fut in cf.as_completed(futs):
                 got[futs[fut]] = fut.result()
+                if len(got) % HEIGHTS_PROGRESS_EVERY == 0 or len(got) == len(futs):
+                    print(f"heights: {len(got)}/{len(futs)} steps at {time.monotonic() - t0:.0f} s "
+                          f"({_clock_line()}; {_machine_line()})")
         except BaseException:
             stop.set()
             pool.shutdown(wait=True, cancel_futures=True)
