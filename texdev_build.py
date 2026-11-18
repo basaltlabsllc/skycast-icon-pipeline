@@ -77,6 +77,17 @@ PREBUILD_ALLOWANCE_S = 20 * 60
 # dir: {"entry": {...}} when the files are written, {"entry": null} when it
 # gave up cleanly (it printed why). Written whole, then renamed into place.
 HEIGHTS_RESULT = "heights-result.json"
+# The cloud heights are OFF unless this variable is "1" (Erik, 2026-11-18:
+# off in the scheduled builds while their slowness is found). On the runner
+# they did not finish inside their budget (run 44221721803), so every run
+# that tried spent that budget and published without them anyway. The
+# scheduled runs (main's copy of texdev.yml) never set it; this branch's
+# hand dispatch sets it from its "heights" input.
+HEIGHTS_ENV = "TEXDEV_HEIGHTS"
+
+
+def heights_wanted(env):
+    return env.get(HEIGHTS_ENV, "") == "1"
 
 
 def job_start(env, fallback):
@@ -220,10 +231,15 @@ def heights_extra(root, state, work, run, names, clues, budget, job, start="spaw
 
 
 def build(out, state, work, deps, steps=None, workers=None, squares=None, env=None, clock=time.time,
-          heights_job=None, heights_start="spawn"):
+          heights_job=None, heights_start="spawn", heights=None):
     # heights_job: what the heights' process runs (testing); None for the real
     # thing. heights_start: how that process is started (run_heights_child).
-    began = job_start(os.environ if env is None else env, clock() - PREBUILD_ALLOWANCE_S)
+    # heights: True/False to say whether the cloud heights are tried (testing);
+    # None reads HEIGHTS_ENV.
+    env = os.environ if env is None else env
+    began = job_start(env, clock() - PREBUILD_ALLOWANCE_S)
+    if heights is None:
+        heights = heights_wanted(env)
     run = dwd.newest_complete_run(deps.listing)
     if run is None:
         print("no complete run on DWD yet")
@@ -246,6 +262,9 @@ def build(out, state, work, deps, steps=None, workers=None, squares=None, env=No
     # again with their key, and whatever else happens this run is BUILT.
     built = deps.now()
     (root / "manifest.json").write_text(manifest(run, built, names, upper, clues))
+    if not heights:
+        print(f"texdev: heights off ({HEIGHTS_ENV} is not 1)")
+        return run_build.BUILT
     try:
         now = clock()
         budget = heights_budget(began, now)

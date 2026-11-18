@@ -54,7 +54,9 @@ def steps():
 
 
 def test_dispatch_only():
-    triggers = [line.strip() for line in top_block(TEXT, "on") if line.strip() and not line.strip().startswith("#")]
+    # The triggers are the keys two spaces in; workflow_dispatch's inputs sit deeper.
+    triggers = [line.strip() for line in top_block(TEXT, "on")
+                if len(line) - len(line.lstrip()) == 2 and not line.strip().startswith("#")]
     assert triggers == ["workflow_dispatch:"]
     for word in ("schedule:", "push:", "pull_request", "workflow_run", "repository_dispatch", "cron:"):
         assert word not in CODE, word
@@ -173,4 +175,15 @@ def test_the_header_says_who_fires_the_scheduled_runs():
     import texdev_build
     assert f"{texdev_build.PREBUILD_ALLOWANCE_S // 60} min before" in head
     # ... and this copy's own triggers are what they were.
-    assert [line.strip() for line in top_block(CODE, "on") if line.strip()] == ["workflow_dispatch:"]
+    on = [line for line in top_block(CODE, "on") if line.strip()]
+    assert [line.strip() for line in on if len(line) - len(line.lstrip()) == 2] == ["workflow_dispatch:"]
+
+
+def test_the_hand_dispatch_tries_the_heights_only_when_asked():
+    # Off by default: the scheduled runs (main's copy) never set the variable,
+    # and a hand dispatch sets it to 1 only with its "heights" box ticked.
+    import texdev_build
+    on = "\n".join(top_block(CODE, "on"))
+    assert re.search(r"heights:\n(?:.*\n)*?\s+type: boolean\n\s+default: false", on)
+    build_env = CODE.split("id: build")[1].split("run: |")[0]
+    assert f"{texdev_build.HEIGHTS_ENV}: ${{{{ inputs.heights && '1' || '0' }}}}" in build_env

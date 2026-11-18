@@ -4,7 +4,10 @@ name: texdev
 # with Alaska and Hawaii, and Iceland) of the newest ICON run, published under
 # texdev/ in the ICON feed's Blob store and nowhere else.
 #
-# The cloud heights are an extra, built in a process of their own: when DWD
+# The cloud heights are OFF unless the build is run with TEXDEV_HEIGHTS=1
+# (this copy's "heights" input; the scheduled runs never set it): on the
+# runner they did not finish inside their budget, and the cause is not found.
+# When tried they are an extra, built in a process of their own: when DWD
 # does not list their files, anything fails or their time runs out, the run
 # publishes without them and its manifest has no "heights" key
 # (texdev_build.heights_extra). The build is told when the job began
@@ -27,6 +30,11 @@ name: texdev
 #    never read or overwrite the live build's state.
 on:
   workflow_dispatch:
+    inputs:
+      heights:
+        description: "Also try the cloud heights (ICH1). Off by default, and always off in the scheduled runs, while their slowness on the runner is found."
+        type: boolean
+        default: false
 permissions:
   contents: write   # the state-texdev push
 concurrency:
@@ -86,6 +94,7 @@ jobs:
         id: build
         env:
           PYTHONUNBUFFERED: "1"
+          TEXDEV_HEIGHTS: ${{ inputs.heights && '1' || '0' }}
         run: |
           set +e
           python texdev_build.py --out-dir blob-texdev --state-dir state-texdev --work-dir work

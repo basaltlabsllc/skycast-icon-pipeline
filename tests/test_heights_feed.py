@@ -98,6 +98,7 @@ def _build(tmp_path, deps, steps=(0, 1), out="out", state="state", **kw):
     # "fork": the fake deps here are closures, which only a fork can hand to
     # the heights' process. The real build starts a fresh interpreter ("spawn").
     kw.setdefault("heights_start", "fork")
+    kw.setdefault("heights", True)
     return texdev_build.build(tmp_path / out, tmp_path / state, tmp_path / "work", deps,
                               steps=list(steps), workers=2, squares=SQUARES, **kw)
 
@@ -528,7 +529,7 @@ def test_an_error_after_the_height_files_are_written_still_only_drops_the_height
 
 # ---- time -------------------------------------------------------------------------------
 
-def _budget_given(tmp_path, monkeypatch, env, clock, out="out"):
+def _budget_given(tmp_path, monkeypatch, env, clock, out="out", **kw):
     """The budget the heights' process is started with (None: never started)."""
     got = []
 
@@ -537,7 +538,7 @@ def _budget_given(tmp_path, monkeypatch, env, clock, out="out"):
         return "fake: not run"
 
     monkeypatch.setattr(texdev_build, "run_heights_child", spy)
-    assert _build(tmp_path, _hdeps(), out=out, state=f"{out}-state", env=env, clock=clock) == run_build.BUILT
+    assert _build(tmp_path, _hdeps(), out=out, state=f"{out}-state", env=env, clock=clock, **kw) == run_build.BUILT
     return got[0] if got else None
 
 
@@ -662,3 +663,27 @@ def test_a_height_that_is_not_falling_with_level_fails_the_heights(tmp_path, cap
     assert _build(tmp_path, _hdeps(steps=steps), steps) == run_build.BUILT
     assert "::warning::heights failed" in capfd.readouterr().out
     assert "heights" not in _manifest(tmp_path)
+
+
+# ---- The switch: heights are off unless TEXDEV_HEIGHTS=1 -----------------------------
+
+def test_heights_are_off_unless_the_variable_says_1():
+    assert texdev_build.HEIGHTS_ENV == "TEXDEV_HEIGHTS"
+    assert texdev_build.heights_wanted({}) is False
+    assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "0"}) is False
+    assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "true"}) is False
+    assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "1"}) is True
+
+
+def test_a_run_with_heights_off_never_starts_them_and_publishes_whole(tmp_path, monkeypatch, capsys):
+    assert _budget_given(tmp_path, monkeypatch, {}, time.time, heights=None) is None
+    out = capsys.readouterr().out
+    assert "heights off" in out and "heights may take" not in out
+    man = _manifest(tmp_path)
+    assert "heights" not in man and man["upper"] and man["clues"]
+
+
+def test_the_variable_set_to_1_tries_the_heights(tmp_path, monkeypatch, capsys):
+    got = _budget_given(tmp_path, monkeypatch, {"TEXDEV_HEIGHTS": "1"}, time.time, heights=None)
+    assert got is not None and got > 0
+    assert "heights may take" in capsys.readouterr().out
