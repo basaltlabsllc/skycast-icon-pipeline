@@ -7,9 +7,14 @@
 # --still-live DIR: is DIR's built fog manifest still for the live run? 0 yes,
 # 3 the live run moved since it was built (discard it), 1 failed. hrrr.yml runs
 # the build in the background and checks this right before publishing it.
+# FOG_TILE_FILES (env, default "1"): "1" writes the per-tile fog files AND the
+# packs (fog/<run>/pack/, hrrr/fogtiles.py) and keeps "tiles" in the entry;
+# "0" writes only the packs, and the entry has no "tiles" (app builds that read
+# tile files then fall back to ICON fog; builds that read packs use "pack").
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -66,8 +71,13 @@ def _retrying(get, sleep):
     return wrapped
 
 
+def tile_files_on(env=os.environ):
+    """FOG_TILE_FILES: "0" turns the per-tile files off; unset or anything else keeps them."""
+    return env.get("FOG_TILE_FILES", "1").strip() != "0"
+
+
 def main(argv=None, fetch_json=_fetch_json, get=_get, now=_now, sleep=time.sleep,
-         build=fogtiles.build_fog):
+         build=fogtiles.build_fog, env=os.environ):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="site-hrrr-fog")
     p.add_argument("--live-manifest", required=False)
@@ -93,7 +103,9 @@ def main(argv=None, fetch_json=_fetch_json, get=_get, now=_now, sleep=time.sleep
             return NOTHING_TO_DO
         run = parse_run(iso)
         out = Path(a.out)
-        entry = build(run, out, _retrying(get, sleep), list(range(last_hour(run) + 1)))
+        tile_files = tile_files_on(env)
+        entry = build(run, out, _retrying(get, sleep), list(range(last_hour(run) + 1)),
+                      tile_files=tile_files)
         again = fetch_json(a.live_manifest)
         if again.get("run") != iso:
             print(f"live run moved {iso} -> {again.get('run')} while building; not publishing")
@@ -104,7 +116,8 @@ def main(argv=None, fetch_json=_fetch_json, get=_get, now=_now, sleep=time.sleep
         (out / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
         files = [f for f in (out / "fog").rglob("*") if f.is_file()]
         size = sum(f.stat().st_size for f in files)
-        print(f"built fog {iso}: {len(entry['tileNames'])} tiles, {len(files)} files, "
+        print(f"built fog {iso}: {len(entry['tileNames'])} tiles, {len(files)} files "
+              f"(tile files {'on' if tile_files else 'off'}), "
               f"{size / 1e6:.1f} MB, {time.monotonic() - t0:.0f} s")
         return BUILT
     except Exception as e:

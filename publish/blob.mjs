@@ -22,17 +22,18 @@
 // earlier one (roots.mjs), so the manifest that goes up is blob/'s.
 //
 // Usage: BLOB_READ_WRITE_TOKEN=… node publish/blob.mjs <siteDir> [<moreDir> …]
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
-import { put, list, del } from '@vercel/blob';
+import { put, list, del, createMultipartUploader } from '@vercel/blob';
+import { putFileParts } from './bigfile.mjs';
 import { pathsToDelete, runFilePath } from './prune.mjs';
 import { planRoots } from './roots.mjs';
 import { createRetry, paceDelay, filesToSend } from './pace.mjs';
 import { pruneOldRuns, DELETES_PER_SEC } from './sweep.mjs';
 import { listAll as listStore, readManifest } from './store.mjs';
 import { stampManifest } from './stamp.mjs';
+import { putOptionsFor, splitPacked, fromFileParts } from './upload.mjs';
 
-const YEAR_S = 365 * 24 * 3600;
 const MANIFEST_S = 60;            // Blob's shortest cache time
 const CONCURRENCY = 16;           // Pro allows 75 uploads/s; leave room for retries
 const ATTEMPTS = 4;
@@ -80,21 +81,33 @@ async function main() {
   const before = await listAll();
   const previous = await readManifest(before);
 
+  // FEED_TILE_FILES=0 (pipeline/pack.py): a folder the manifest names only by
+  // its pack goes up as the pack alone (upload.mjs splitPacked).
+  const packed = splitPacked(files, current);
+  if (packed.skipped) console.log(`${packed.skipped} per-file copies of packed folders not uploaded (tile files off)`);
   const t0 = Date.now();
   const bytesByDir = Object.fromEntries(dirs.map((d) => [d, 0]));
   const countByDir = Object.fromEntries(dirs.map((d) => [d, 0]));
-  const send = filesToSend(files, before.map((b) => b.pathname), process.env.BLOB_SKIP_EXISTING === '1');
-  if (send.length !== files.length) console.log(`resuming: ${files.length - send.length} files already in the store`);
+  const send = filesToSend(packed.send, before.map((b) => b.pathname), process.env.BLOB_SKIP_EXISTING === '1');
+  if (send.length !== packed.send.length) console.log(`resuming: ${packed.send.length - send.length} files already in the store`);
   await pool(send, CONCURRENCY, async ({ path, dir }, k) => {
     const wait = paceDelay(k, PER_SEC, t0, Date.now());
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    const body = await readFile(join(dir, path));
-    bytesByDir[dir] += body.length;
+    const full = join(dir, path);
+    const size = (await stat(full)).size;
+    bytesByDir[dir] += size;
     countByDir[dir] += 1;
-    await retry(path, () => put(path, body, {
-      access: 'public', addRandomSuffix: false, allowOverwrite: true,
-      cacheControlMaxAge: YEAR_S, contentType: 'application/octet-stream',
-    }));
+    if (fromFileParts(size)) {
+      // FILE_PARTS_BYTES or more (ICON's column pack): part by part from disk,
+      // each part retried on its own, never the whole file in memory (bigfile.mjs).
+      const { multipart, ...options } = putOptionsFor(path, size);
+      await retry(path, () => putFileParts(createMultipartUploader, path, full, size, options,
+        { attempt: (fn) => retry(`${path} part`, fn) }));
+      return;
+    }
+    const body = await readFile(full);
+    // Files of MULTIPART_BYTES or more (the HRRR fog packs) go up multipart (upload.mjs).
+    await retry(path, () => put(path, body, putOptionsFor(path, size)));
   });
   const bytes = Object.values(bytesByDir).reduce((a, b) => a + b, 0);
   console.log(`uploaded ${send.length} files, ${(bytes / 1e6).toFixed(0)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s (`

@@ -74,6 +74,55 @@ def _fake_deps(tmp_path, world_value=lambda step, field: 0, prev_manifest=None,
 WHOLE = {"columns": {"x": 1}, "thick": {"x": 1}, "blocks": "blocks/x", "tail": {"x": 1}}
 
 
+def _clear_build(tmp_path):
+    deps, _ = _fake_deps(tmp_path, world_value=lambda s, f: 10)
+    rc = run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
+                         deps=deps, pages_base=None, steps=list(range(0, 79)), squares=["N40W125"])
+    return rc, tmp_path / "site", tmp_path / "blob"
+
+
+def _blob_files(blob, rel):
+    root = blob / rel
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def test_clear_night_goes_to_blob_as_one_pack_and_the_blob_manifest_names_only_it(tmp_path):
+    rc, site, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
+    assert cn["format"] == "CLN2" and cn["keys"] == ["N30W140"] and cn["nights"]
+    assert "tiles" not in cn
+    assert cn["pack"].startswith("clearnight/2026092700/pack-")
+    # Two Blob puts a run: the pack and its index; the per-file tiles are gone.
+    name = cn["pack"].rsplit("/", 1)[1]
+    assert _blob_files(blob, "clearnight/2026092700") == [f"{name}/all.bin", f"{name}/index.json"]
+    idx = json.loads((blob / cn["pack"] / "index.json").read_text())
+    assert f"{cn['nights'][0]}_N30W140.cln" in idx["names"]
+    assert len(idx["names"]) == len(cn["nights"]) * len(cn["keys"])
+
+
+def test_a_clear_night_pack_that_fails_falls_back_to_the_per_file_tiles(tmp_path, monkeypatch):
+    real = run_build.pack.try_pack
+    monkeypatch.setattr(run_build.pack, "try_pack", lambda root, rel, *a, **k: None if rel.startswith("clearnight/") else real(root, rel, *a, **k))
+    rc, site, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    cn = json.loads((blob / "manifest.json").read_text())["clearNight"]
+    assert cn["tiles"] == "clearnight/2026092700" and "pack" not in cn
+    assert (blob / cn["tiles"] / f"{cn['nights'][0]}_N30W140.cln").exists()
+    assert "clearNight" not in json.loads((site / "manifest.json").read_text())
+    assert not (site / "clearnight").exists()
+
+
+def test_a_failed_clear_night_never_fails_the_build(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    monkeypatch.setattr(run_build.clearnight, "build_clearnight", boom)
+    rc, _, blob = _clear_build(tmp_path)
+    assert rc == run_build.BUILT
+    assert "clearNight" not in json.loads((blob / "manifest.json").read_text())
+    assert not (blob / "clearnight").exists()
+
+
 def test_early_exit_when_the_site_already_has_this_run(tmp_path, capsys):
     deps, calls = _fake_deps(tmp_path, prev_manifest={"run": "2026-09-27T00Z", "complete": True, **WHOLE})
     rc = run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
@@ -354,6 +403,7 @@ def test_thickness_goes_to_blob_by_the_squares_hours(tmp_path):
     deps, calls = _fake_deps(tmp_path)
     site, blob = _thick_build(tmp_path, deps, range(7))
     feed = json.loads((blob / "manifest.json").read_text())
+    assert _is_pack(feed["thick"].pop("pack"), "thick/2026092700")
     assert feed["thick"] == {"format": "ICT1", "run": "2026-09-27T00Z", "runMs": int(RUN.timestamp() * 1000),
                              "tiles": "thick/2026092700"}
     ict = _ict_of(blob)
@@ -724,13 +774,16 @@ def test_the_columns_go_to_blob_only_and_never_touch_the_pages_budget(tmp_path, 
     assert not (site / "columns").exists() and pages["columns"] is None
     # Blob: the columns, and a manifest equal to Pages' but for its columns key.
     assert run_build._dir_bytes(blob / feed["columns"]["tiles"]) > 0
-    # (the blocks and the thickness are Blob-only too: the manifests differ in those keys alone)
-    blob_only = ("columns", "blocks", "thick")
+    # (the blocks, the thickness and the packs are Blob-only too: the manifests differ in those keys alone)
+    blob_only = ("columns", "blocks", "thick", "tilesPack", "blocksPack")
     assert pages["thick"] is None and feed["thick"] is not None
     assert {k: v for k, v in feed.items() if k not in blob_only} == \
         {k: v for k, v in pages.items() if k not in blob_only}
+    # blob/tiles holds the squares' pack alone (the squares themselves are in site/).
     assert sorted(p.relative_to(blob).parts[0] for p in blob.iterdir()) == \
-        ["blocks", "columns", "manifest.json", "thick"]
+        ["blocks", "columns", "manifest.json", "thick", "tiles"]
+    assert sorted(p.relative_to(blob).as_posix() for p in (blob / "tiles").rglob("*") if p.is_file()) == \
+        [f"{feed['tilesPack']}/all.bin", f"{feed['tilesPack']}/index.json"]
     clouds = run_build._dir_bytes(site / "tiles")
     capsys.readouterr()
     # A budget the clouds just fit: however big the columns, the squares stay in 2 % steps.
@@ -804,3 +857,109 @@ def test_history_runs_go_in_both_manifests(tmp_path):
     assert json.loads((blob / "manifest.json").read_text())["historyRuns"] == want
     for d in (site, blob):
         assert json.loads((d / "manifest.json").read_text())["historyRecordSinceMs"] == prev_ms + 4 * 3600000
+
+
+# ---- Packs (PACK1, pipeline/pack.py): Blob only ------------------------------
+
+def _is_pack(path, folder):
+    """folder/pack-<first 12 hex of sha256(all.bin)>."""
+    return re.fullmatch(re.escape(folder) + r"/pack-[0-9a-f]{12}", path or "") is not None
+
+
+def _pack_dirs(d):
+    return [p.name for p in d.iterdir() if p.is_dir()] if d.is_dir() else []
+
+
+def _pack_matches(files_root, pack_root, folder, pack_rel):
+    """Every file of files_root/folder, byte-exact, at its span of the pack."""
+    idx = json.loads((pack_root / pack_rel / "index.json").read_text())
+    data = (pack_root / pack_rel / "all.bin").read_bytes()
+    names = sorted(p.name for p in (files_root / folder).iterdir() if p.is_file())
+    assert idx["format"] == "PACK1" and idx["names"] == names and names
+    for i, n in enumerate(names):
+        start = idx["ends"][i - 1] if i else 0
+        assert data[start:idx["ends"][i]] == (files_root / folder / n).read_bytes(), n
+    assert len(data) == idx["ends"][-1]
+
+
+def test_a_full_build_packs_tiles_tail_blocks_and_thick_into_blob_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEED_TILE_FILES", raising=False)
+    deps, _ = _fake_deps_with_tail(tmp_path)
+    assert run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
+                           deps=deps, pages_base="https://x", steps=None, squares=None, workers=2) == run_build.BUILT
+    site, blob = tmp_path / "site", tmp_path / "blob"
+    feed = json.loads((blob / "manifest.json").read_text())
+    pages = json.loads((site / "manifest.json").read_text())
+    # Tile files on (the default): the per-file keys stay beside the pack keys.
+    assert feed["tiles"] == "tiles/2026092700" and _is_pack(feed["tilesPack"], "tiles/2026092700")
+    assert feed["blocks"] == "blocks/2026092700" and _is_pack(feed["blocksPack"], "blocks/2026092700")
+    assert feed["tail"]["tiles"] == "tail/2026092700" and _is_pack(feed["tail"]["pack"], "tail/2026092700")
+    assert feed["thick"]["tiles"] == "thick/2026092700" and _is_pack(feed["thick"]["pack"], "thick/2026092700")
+    # tiles and tail are in site/ (Pages and Blob); their packs go to blob/ alone.
+    _pack_matches(site, blob, "tiles/2026092700", feed["tilesPack"])
+    _pack_matches(site, blob, "tail/2026092700", feed["tail"]["pack"])
+    _pack_matches(blob, blob, "blocks/2026092700", feed["blocksPack"])
+    _pack_matches(blob, blob, "thick/2026092700", feed["thick"]["pack"])
+    # Pages: no pack files, no pack keys.
+    assert not any(p.name.startswith("pack") for p in site.rglob("*"))
+    assert "tilesPack" not in pages and "blocksPack" not in pages and "pack" not in (pages["tail"] or {})
+
+
+def test_the_columns_get_a_pack_too(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEED_TILE_FILES", raising=False)
+    deps, _ = _deps_with_columns(tmp_path, [0, 1])
+    assert _columns_build(tmp_path, deps, [0, 1]) == run_build.BUILT
+    blob = tmp_path / "blob"
+    feed = json.loads((blob / "manifest.json").read_text())
+    assert feed["columns"]["tiles"] == "columns/2026092700"
+    assert _is_pack(feed["columns"]["pack"], "columns/2026092700")
+    _pack_matches(blob, blob, "columns/2026092700", feed["columns"]["pack"])
+
+
+def test_tile_files_off_drops_the_per_file_keys_from_the_blob_manifest_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FEED_TILE_FILES", "0")
+    deps, _ = _fake_deps_with_tail(tmp_path)
+    assert run_build.build(site=tmp_path / "site", state=tmp_path / "state", work=tmp_path / "work",
+                           deps=deps, pages_base="https://x", steps=None, squares=None, workers=2) == run_build.BUILT
+    assert "tile files off" in capsys.readouterr().out
+    site, blob = tmp_path / "site", tmp_path / "blob"
+    feed = json.loads((blob / "manifest.json").read_text())
+    assert "tiles" not in feed and _is_pack(feed["tilesPack"], "tiles/2026092700")
+    assert "blocks" not in feed and _is_pack(feed["blocksPack"], "blocks/2026092700")
+    assert "tiles" not in feed["tail"] and _is_pack(feed["tail"]["pack"], "tail/2026092700")
+    assert "tiles" not in feed["thick"] and _is_pack(feed["thick"]["pack"], "thick/2026092700")
+    # Pages is untouched: per-file squares and tail, named as before.
+    pages = json.loads((site / "manifest.json").read_text())
+    assert pages["tiles"] == "tiles/2026092700" and pages["tail"]["tiles"] == "tail/2026092700"
+    assert (site / "tiles" / "2026092700" / "N40W125.icl").exists()
+
+
+def test_a_failed_pack_drops_its_key_never_the_build(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FEED_TILE_FILES", "0")
+    from pipeline import pack
+    real = pack.pack_folder
+
+    def flaky(root, rel, dest=None):
+        if rel.startswith("blocks/"):
+            raise OSError("disk full")
+        return real(root, rel, dest)
+    monkeypatch.setattr(pack, "pack_folder", flaky)
+    site, blob = _blocks_build(tmp_path, [0, 1], lambda s, f: 10, squares=["N40W125"])
+    feed = json.loads((blob / "manifest.json").read_text())
+    assert "::warning::pack blocks/2026092700 failed" in capsys.readouterr().out
+    assert "blocksPack" not in feed and feed["blocks"] == "blocks/2026092700"   # still named: still uploaded
+    assert _is_pack(feed["tilesPack"], "tiles/2026092700") and "tiles" not in feed
+    assert _pack_dirs(blob / "blocks" / "2026092700") == []
+
+
+def test_a_repair_that_changes_the_squares_gets_new_pack_folders(tmp_path, monkeypatch):
+    # An ICON repair rebuilds the same run in place; all.bin is cached a year,
+    # so changed bytes must land at a new path the new manifest names.
+    monkeypatch.delenv("FEED_TILE_FILES", raising=False)
+    _, blob_a = _blocks_build(tmp_path / "a", [0, 1], lambda s, f: 10, squares=["N40W125"])
+    _, blob_b = _blocks_build(tmp_path / "b", [0, 1], lambda s, f: 10, squares=["N40W125"])
+    _, blob_c = _blocks_build(tmp_path / "c", [0, 1], lambda s, f: 30, squares=["N40W125"])
+    a, b, c = (json.loads((d / "manifest.json").read_text()) for d in (blob_a, blob_b, blob_c))
+    assert a["tilesPack"] == b["tilesPack"] and a["blocksPack"] == b["blocksPack"]
+    assert a["tilesPack"] != c["tilesPack"] and a["blocksPack"] != c["blocksPack"]
+    assert a["tiles"] == c["tiles"]                              # the run folder itself is the same

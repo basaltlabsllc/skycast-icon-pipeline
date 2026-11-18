@@ -251,8 +251,11 @@ def test_build_ifs_end_to_end(monkeypatch, tmp_path):
     assert man["model"] == "ifs" and man["complete"] is True and man["historySteps"] == 0
     assert man["stepsMs"] == [base * 3_600_000, (base + 6) * 3_600_000]
     assert man["tail"]["stepsMs"] == [(base + 12) * 3_600_000] and man["tail"]["tiles"] == tail_path(RUN)
+    assert man["thick"].pop("pack").startswith(thick_path(RUN) + "/pack-")
     assert man["thick"] == {"format": "ICT1", "run": "2026-11-08T00Z", "runMs": int(RUN.timestamp() * 1000),
                             "tiles": thick_path(RUN)}
+    assert man["tilesPack"].startswith(tiles_path(RUN) + "/pack-")
+    assert man["tail"]["pack"].startswith(tail_path(RUN) + "/pack-")
     n = square_name(40, -110)
     icl = decode_square((tmp_path / tiles_path(RUN) / f"{n}.icl").read_bytes())
     icb = blocks.decode_blocks((tmp_path / blocks_path(RUN) / f"{n}.icb").read_bytes(), 4)

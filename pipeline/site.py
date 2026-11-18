@@ -35,7 +35,8 @@ def wind_path(run):
 
 
 def build_manifest(run, built, step_hours, squares, history_hours, complete=True, tail=None, columns=None,
-                   blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None):
+                   blocks=None, thick=None, repairs=0, history_runs=None, history_since_ms=None,
+                   clear_night=None):
     out = {
         "run": run_iso(run),
         # False for a test build (some steps, some squares). Only a complete
@@ -82,4 +83,9 @@ def build_manifest(run, built, step_hours, squares, history_hours, complete=True
     # with no entry above never went out. Absent when unknown.
     if history_since_ms is not None:
         out["historyRecordSinceMs"] = int(history_since_ms)
+    # SkyCast's Clear Night map (pipeline/clearnight.py, CLN1): {format,
+    # tiles, nights, deg, side, clearMax, darkAltDeg, keys, bytes}. Blob only,
+    # absent otherwise; older readers ignore the key.
+    if clear_night is not None:
+        out["clearNight"] = clear_night
     return json.dumps(out, separators=(",", ":"))

@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
+import json
+
 import hrrr.fogtiles as ft
 from hrrr.fog import FOG_FIELDS
 from pipeline.columns import decode_columns
@@ -84,6 +86,7 @@ def test_build_fog_values(patched, tmp_path):
 def test_build_fog_entry(patched, tmp_path):
     entry = ft.build_fog(RUN, tmp_path, None, 8)
     assert entry["tiles"] == "fog/2026111012"
+    assert entry["pack"] == "fog/2026111012/pack"
     assert entry["format"] == "ICC1" and entry["run"] == "2026-11-10T12Z"
     assert entry["runMs"] == int(RUN.timestamp() * 1000)
     assert entry["blockHours"] == ft.FOG_BLOCK_HOURS
@@ -97,3 +100,63 @@ def test_build_fog_rejects_bad_steps(patched, tmp_path, steps):
     with pytest.raises(ValueError):
         ft.build_fog(RUN, tmp_path, None, steps)
     assert not (tmp_path / "fog").exists()
+
+
+def _index(tmp_path):
+    return json.loads((tmp_path / "fog/2026111012/pack/index.json").read_text())
+
+
+def test_pack_slices_equal_tile_files(patched, tmp_path):
+    entry = ft.build_fog(RUN, tmp_path, None, 8)
+    root = tmp_path / "fog" / "2026111012"
+    idx = _index(tmp_path)
+    assert len(idx["ends"]) == 2
+    assert len(entry["tileNames"]) >= 2   # slices past the first tile are exercised
+    for k, ends in enumerate(idx["ends"]):
+        pack = (root / "pack" / f"{k}.iccp").read_bytes()
+        assert ends[-1] == len(pack)
+        for i, name in enumerate(entry["tileNames"]):
+            start = 0 if i == 0 else ends[i - 1]
+            assert pack[start:ends[i]] == (root / name / f"{k}.icc").read_bytes(), (k, name)
+    assert not (root / "pack" / "2.iccp").exists()
+
+
+def test_pack_index_shape(patched, tmp_path):
+    entry = ft.build_fog(RUN, tmp_path, None, 8)
+    idx = _index(tmp_path)
+    assert set(idx) == {"format", "run", "tileNames", "ends"}
+    assert idx["format"] == "ICCP1" and idx["run"] == entry["run"] == "2026-11-10T12Z"
+    assert idx["tileNames"] == entry["tileNames"] and len(idx["tileNames"]) >= 1
+    for ends in idx["ends"]:
+        assert len(ends) == len(idx["tileNames"])
+        assert all(isinstance(e, int) for e in ends)
+        assert all(b > a for a, b in zip([0] + ends, ends))
+
+
+def test_tile_files_off_writes_only_pack(patched, tmp_path):
+    entry = ft.build_fog(RUN, tmp_path, None, 8, tile_files=False)
+    root = tmp_path / "fog" / "2026111012"
+    files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    assert files == ["pack/0.iccp", "pack/1.iccp", "pack/index.json"]
+    assert "tiles" not in entry
+    assert entry["pack"] == "fog/2026111012/pack"
+    assert entry["tileNames"] == _index(tmp_path)["tileNames"]
+    d = decode_columns((root / "pack" / "0.iccp").read_bytes()[:_index(tmp_path)["ends"][0][0]])
+    assert (d["sw_lat"], d["sw_lon"]) == (44, -122)
+
+
+def test_tile_files_off_pack_matches_on(patched, tmp_path):
+    ft.build_fog(RUN, tmp_path / "on", None, 8)
+    ft.build_fog(RUN, tmp_path / "off", None, 8, tile_files=False)
+    for f in ("0.iccp", "1.iccp", "index.json"):
+        rel = f"fog/2026111012/pack/{f}"
+        assert (tmp_path / "on" / rel).read_bytes() == (tmp_path / "off" / rel).read_bytes()
+
+
+def test_tile_files_on_keeps_both(patched, tmp_path):
+    entry = ft.build_fog(RUN, tmp_path, None, 8, tile_files=True)
+    root = tmp_path / "fog" / "2026111012"
+    assert entry["tiles"] == "fog/2026111012" and entry["pack"] == "fog/2026111012/pack"
+    for name in entry["tileNames"]:
+        assert (root / name / "0.icc").is_file() and (root / name / "1.icc").is_file()
+    assert (root / "pack" / "0.iccp").is_file() and (root / "pack" / "index.json").is_file()
