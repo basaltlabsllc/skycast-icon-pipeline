@@ -73,7 +73,7 @@ def _rmsg(kind, lev, vals, uv_relative=1, sample=None, surface_kind="surface", p
                 ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", 0))
     else:
         h = eccodes.codes_grib_new_from_samples(sample or "rotated_ll_pl_grib2")
-        cat, num = param or {"u": (2, 2), "v": (2, 3), "clmr": (1, 22), "icmr": (1, 23)}[kind]
+        cat, num = param or {"u": (2, 2), "v": (2, 3), "clmr": (1, 22), "icmr": (1, 23), "absv": (2, 10)}[kind]
         spec = (("parameterCategory", cat), ("parameterNumber", num), ("typeOfFirstFixedSurface", 100),
                 ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", lev * 100))
     keys = [("Ni", 2), ("Nj", 2), ("latitudeOfFirstGridPointInDegrees", 1.0),
@@ -107,7 +107,7 @@ def _layer_files(fh, u_of=lambda lev: lev / 10.0, v_of=lambda lev: -1.0, clmr_of
             if (name, lev) not in skip:
                 x = (u_of if kind == "u" else v_of)(lev) if mine else 99.0
                 prs.append((name, f"{lev} mb", want, _rmsg(kind, lev, [x] * CELLS, **kw)))
-        prs.append(("ABSV", f"{lev} mb", want, filler))
+        prs.append(("ABSV", f"{lev} mb", want, _rmsg("absv", lev, [1e-5] * CELLS, **kw)))
         for kind, name, f in (("clmr", "CLMR", clmr_of), ("icmr", "ICMR", icmr_of)):
             if (name, lev) not in skip:
                 prs.append((name, f"{lev} mb", want, _rmsg(kind, lev, [f(lev) if mine else 0.0] * CELLS, **kw)))
@@ -176,22 +176,70 @@ def test_a_missing_row_fails_the_whole_step():
 
 
 # ---- requests per step --------------------------------------------------------
-def test_touching_rows_are_one_request_and_a_step_makes_39_requests():
+def test_a_level_is_one_request_and_a_step_makes_21_requests():
     f = _layer_files(6)
     rg.read_layer_wind(RUN, 6, f.get)
     prs, sfc = rg.prs_url(RUN, 6), rg.file_url(RUN, 6)
     urls = [u for u, _ in f.calls]
     assert urls.count(prs + ".idx") == 1 and urls.count(sfc + ".idx") == 1
     ranged = [(u, r) for u, r in f.calls if r is not None]
-    assert len([1 for u, _ in ranged if u == prs]) == 36 and len([1 for u, _ in ranged if u == sfc]) == 1
-    assert len(f.calls) == 2 + 36 + 1 == 39
-    # each prslev request carries exactly two messages (u+v, or clmr+icmr), never one per field
+    assert len([1 for u, _ in ranged if u == prs]) == 18 and len([1 for u, _ in ranged if u == sfc]) == 1
+    assert len(f.calls) == 2 + 18 + 1 == 21
+    # each prslev request is u .. icmr of one level: five messages, u's start to icmr's end
     r = rg.layer_wind_ranges(f.idx[prs + ".idx"].decode(), f.idx[sfc + ".idx"].decode(), 6)
-    starts = {s: (k, e) for k, (s, e) in r.items() if k[0] != "sfc"}
-    for u, (s, e) in ranged:
-        if u == prs:
-            assert s in starts and starts[s][0][1] in ("u", "clmr")
-            assert e == r[(starts[s][0][0], "v" if starts[s][0][1] == "u" else "icmr")][1]
+    want = {(r[(lev, "u")][0], r[(lev, "icmr")][1]) for lev in LEVELS}
+    assert {rng for u, rng in ranged if u == prs} == want
+
+
+def test_the_plan_names_the_absv_message_as_the_one_to_skip():
+    _, plan = rg.layer_wind_plan(_prs_idx(), _sfc_idx(), 6)
+    prs = [k for which, _, k in plan if which == "prs"]
+    assert all(len(k) == 5 and k[2] is None and [x[1] for x in k if x] == ["u", "v", "clmr", "icmr"] for k in prs)
+
+
+def _with_row_moved(prs_idx, lev, name_from, name_to):
+    """Swap two rows' names in the idx text (offsets stay): the byte layout no longer matches the order
+    the reader expects at that level."""
+    rows = prs_idx.split("\n")
+    ia = next(i for i, r in enumerate(rows) if f":{name_from}:{lev} mb:" in r)
+    ib = next(i for i, r in enumerate(rows) if f":{name_to}:{lev} mb:" in r)
+    ra, rb_ = rows[ia].split(":"), rows[ib].split(":")
+    ra[3], rb_[3] = rb_[3], ra[3]
+    rows[ia], rows[ib] = ":".join(ra), ":".join(rb_)
+    return "\n".join(rows)
+
+
+def test_a_level_whose_rows_are_not_in_the_expected_order_falls_back_to_separate_requests():
+    idx = _with_row_moved(_prs_idx(), 700, "ABSV", "CLMR")           # ABSV and CLMR trade places in the idx
+    _, plan = rg.layer_wind_plan(idx, _sfc_idx(), 6)
+    at700 = [k for which, _, k in plan if which == "prs" and any(x and x[0] == 700 for x in k)]
+    assert len(at700) > 1 and all(None not in k for k in at700)       # never one wide span, no skipped message
+    assert sum(len(k) for k in at700) == 4
+    # every other level is still one request of five
+    others = [k for which, _, k in plan if which == "prs" and not any(x and x[0] == 700 for x in k)]
+    assert len(others) == 17 and all(len(k) == 5 for k in others)
+    # and a full step on such an idx costs 21 + (more) requests but still never spans more than five messages
+    f = _layer_files(6)
+    f.idx[rg.prs_url(RUN, 6) + ".idx"] = idx.encode()
+    with pytest.raises(ValueError, match="expected"):                # the fixture's bytes disagree with the swapped names
+        rg.read_layer_wind(RUN, 6, f.get)
+
+
+def test_a_missing_absv_row_falls_back_instead_of_widening():
+    rows = [r for r in _prs_idx().split("\n") if ":ABSV:500 mb:" not in r]
+    _, plan = rg.layer_wind_plan("\n".join(rows), _sfc_idx(), 6)
+    at500 = [k for which, _, k in plan if which == "prs" and any(x and x[0] == 500 for x in k)]
+    assert all(None not in k for k in at500) and sum(len(k) for k in at500) == 4
+
+
+def test_the_message_between_v_and_clmr_must_be_absv_by_parameter():
+    f = _layer_files(6)
+    url = rg.prs_url(RUN, 6)
+    right, wrong = _rmsg("absv", 700, [1e-5] * CELLS), _rmsg("u", 700, [1e-5] * CELLS)
+    assert len(right) == len(wrong) and f.blobs[url].count(right) == 1
+    f.blobs[url] = f.blobs[url].replace(right, wrong)
+    with pytest.raises(ValueError, match="absolute vorticity"):
+        rg.read_layer_wind(RUN, 6, f.get)
 
 
 # ---- values: the deck winds on the cloud layer --------------------------------
@@ -362,7 +410,7 @@ def test_build_wind_writes_the_cover_groups_and_entry_through_the_limiter(tmp_pa
     lim = rb.RateLimiter(1000)
     entry = rb.build_wind(RUN, tmp_path, rb.limited(_get_for(files), lim), lambda s: None, [0, 1], 2)
     assert entry == wind.manifest_entry(RUN, layer="cloud") and entry["layer"] == "cloud"
-    assert len(lim._stamps) == 78                     # 39 requests an hour, every one counted
+    assert len(lim._stamps) == 42                     # 21 requests an hour, every one counted
     base = int(RUN.timestamp() // 3600)
     names = sorted(p.name for p in (tmp_path / "wind/2026111618").glob("*.icw"))
     assert names and all(n in [g + ".icw" for g in rb.WIND_GROUPS] for n in names)
@@ -428,3 +476,24 @@ def test_build_wind_drops_the_key_when_a_step_lacks_a_cloud_row(tmp_path):
     files = {0: _layer_files(0), 1: _layer_files(1, skip=(("ICMR", 850),))}
     assert rb.build_wind(RUN, tmp_path, _get_for(files), lambda s: None, [0, 1], 2) is None
     assert not (tmp_path / "wind").exists()
+
+
+def test_wind_hours_are_every_third_hour_and_the_cover_stays_hourly():
+    assert rb.WIND_STEP_H == 3
+    assert rb.wind_hours(list(rb.STEPS)) == list(range(0, 85, 3)) and len(rb.wind_hours(list(rb.STEPS))) == 29
+    assert rb.STEPS == tuple(range(85))                      # the cover is untouched
+    assert rb.wind_hours([1, 2, 4]) == []
+
+
+def test_build_hands_wind_only_the_wind_hours_and_the_cover_every_hour(monkeypatch, tmp_path):
+    got, covered = [], []
+    monkeypatch.setattr(rb, "build_wind", lambda run, out, get, sleep, fhs, workers, **k: got.append(list(fhs)))
+    lat, lon = np.meshgrid(np.arange(30.0, 50.0, 1.0), np.arange(-120.0, -100.0, 1.0), indexing="ij")
+
+    def fields(run, fh, get):
+        covered.append(fh)
+        return {"lat": lat.ravel(), "lon": lon.ravel(), **{n: np.full(lat.size, 40.0) for n, _ in rb.FIELDS}}
+
+    monkeypatch.setattr(rb, "read_fields", fields)
+    rb.build(RUN, tmp_path, lambda u, r=None: b"", NOW, sleep=lambda s: None)
+    assert got == [list(range(0, 85, 3))] and sorted(covered) == list(range(85))

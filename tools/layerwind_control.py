@@ -202,7 +202,7 @@ def main(argv):
     if len(argv) == 4 and argv[1] == "hrrr-threshold":
         return hrrr_threshold(argv)
     if len(argv) == 6 and argv[1] == "rrfs":
-        return hrrr_node(argv, rgrib, "RRFS", rrfs_get, steps=len(rbuild.STEPS), workers=rbuild.workers())
+        return hrrr_node(argv, rgrib, "RRFS", rrfs_get, steps=len(rbuild.wind_hours(rbuild.STEPS)), workers=rbuild.workers())
     if len(argv) == 4 and argv[1] == "rrfs-threshold":
         return hrrr_threshold(argv, rgrib, "RRFS", rrfs_get)
     if len(argv) != 6 or argv[1] != "gfs":

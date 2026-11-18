@@ -155,28 +155,57 @@ _PARAMS = {"u": ("UGRD", (0, 2, 2)), "v": ("VGRD", (0, 2, 3)),
            "clmr": ("CLMR", (0, 1, 22)), "icmr": ("ICMR", (0, 1, 23))}
 
 
+def _locate(rows, name, level, want):
+    k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
+              and r[4] == level and r[5] == want), None)
+    if k is None:
+        raise KeyError(f"{name} ({level}, {want}) not in idx")
+    return k
+
+
 def layer_wind_ranges(prs_idx, sfc_idx, fh):
     """{(level hPa, 'u'|'v'|'clmr'|'icmr'): (start, end), ('sfc', 'pres'): (start, end)}
     for forecast hour fh ("anl" at f00). The level keys index the prslev file
     (prs_idx), ('sfc', 'pres') the 2dfld file (sfc_idx). Rows are picked by exact
     name, level text and forecast text; end is inclusive or None for the file's
     last message. KeyError if any row is missing."""
+    return layer_wind_plan(prs_idx, sfc_idx, fh)[0]
+
+
+def layer_wind_plan(prs_idx, sfc_idx, fh):
+    """(ranges, requests): ranges as layer_wind_ranges; requests = [(which, (start, end),
+    [key or None, ...])], which = 'prs' | 'sfc', one entry per ranged request, its keys in
+    file order. A level whose rows run UGRD, VGRD, ABSV, CLMR, ICMR back to back in the idx
+    (NOAA's order, checked 2026-11-18) is ONE request carrying five messages: the ABSV one is
+    downloaded and thrown away (key None). Any other layout at a level falls back to the
+    rows that touch merged, never a wider span."""
     want = "anl" if fh == 0 else f"{fh} hour fcst"
-
-    def find(rows, name, level):
-        k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
-                  and r[4] == level and r[5] == want), None)
-        if k is None:
-            raise KeyError(f"{name} ({level}, {want}) not in idx")
-        return _range_of(rows, k)
-
     prs, sfc = _rows(prs_idx), _rows(sfc_idx)
-    out = {}
+    ranges, requests = {}, []
     for lev in RRFS_WIND_LEVELS:
-        for comp, (name, _) in _PARAMS.items():
-            out[(lev, comp)] = find(prs, name, f"{lev} mb")
-    out[("sfc", "pres")] = find(sfc, "PRES", "surface")
-    return out
+        at = {comp: _locate(prs, name, f"{lev} mb", want) for comp, (name, _) in _PARAMS.items()}
+        for comp, k in at.items():
+            ranges[(lev, comp)] = _range_of(prs, k)
+        k0 = at["u"]
+        last = _range_of(prs, at["icmr"])
+        if (at["v"] == k0 + 1 and at["clmr"] == k0 + 3 and at["icmr"] == k0 + 4
+                and prs[k0 + 2][3] == "ABSV" and prs[k0 + 2][4] == f"{lev} mb" and prs[k0 + 2][5] == want
+                and last[1] is not None):
+            requests.append(("prs", (ranges[(lev, "u")][0], last[1]),
+                             [(lev, "u"), (lev, "v"), None, (lev, "clmr"), (lev, "icmr")]))
+        else:
+            ks = [(lev, c) for c in _PARAMS]
+            for rng, positions in _groups([(k, ranges[k]) for k in ks]):
+                requests.append(("prs", rng, [ks[i] for i in positions]))
+    ranges[("sfc", "pres")] = _range_of(sfc, _locate(sfc, "PRES", "surface", want))
+    requests.append(("sfc", ranges[("sfc", "pres")], [("sfc", "pres")]))
+    return ranges, requests
+
+
+def _check_absv(g):
+    triple = tuple(int(eccodes.codes_get(g, k)) for k in ("discipline", "parameterCategory", "parameterNumber"))
+    if triple != (0, 2, 10):
+        raise ValueError(f"wind: expected the absolute vorticity message between v and clmr, message is {triple}")
 
 
 def _check_layer_message(g, lev, comp):
@@ -204,41 +233,42 @@ def read_layer_fields(run, fh, get, keep_condensate=False):
     ranged request. Every message is checked against its idx row by parameter and
     level; a missing row raises KeyError."""
     prs, sfc = prs_url(run, fh), file_url(run, fh)
-    ranges = layer_wind_ranges(get(prs + ".idx").decode(), get(sfc + ".idx").decode(), fh)
-    keys = list(ranges)
+    _, requests = layer_wind_plan(get(prs + ".idx").decode(), get(sfc + ".idx").decode(), fh)
     out, turn = {}, None
     uv, cond, ps = {}, {}, None
-    for url, ks in ((prs, [k for k in keys if k[0] != "sfc"]), (sfc, [("sfc", "pres")])):
-        for rng, positions in _groups([(k, ranges[k]) for k in ks]):
-            msgs = split_messages(get(url, rng))
-            if len(msgs) != len(positions):
-                raise ValueError(f"wind: asked for {len(positions)} messages, got {len(msgs)}")
-            for pos, raw in zip(positions, msgs):
-                lev, comp = ks[pos]
-                g = eccodes.codes_new_from_message(raw)
-                try:
-                    _check_layer_message(g, lev, comp)
-                    if "lat" not in out:
-                        out["lat"], out["lon"], turn = _wind_geometry(g)
-                    vals = eccodes.codes_get_values(g)
-                    miss = eccodes.codes_get(g, "missingValue")
-                finally:
-                    eccodes.codes_release(g)
-                if vals.shape != out["lat"].shape:
-                    raise ValueError(f"wind: {comp} {lev} has {vals.size} cells, the grid has {out['lat'].size}")
-                vals = np.where(np.isclose(vals, miss), np.nan, vals)
-                if lev == "sfc":
-                    ps = vals / 100.0
-                elif comp in ("u", "v"):
-                    uv.setdefault(lev, {})[comp] = vals.astype(np.float32)
-                else:
-                    # cloud water + ice; a missing part counts as none, both missing is clear
-                    part = np.where(np.isnan(vals), 0.0, vals).astype(np.float32)
-                    have, acc = cond.get(lev, (0, None))
-                    acc = part if acc is None else acc + part
-                    cond[lev] = (have + 1, acc)
-                    if have + 1 == 2 and not keep_condensate:
-                        cond[lev] = (2, acc >= layerwind.CONDENSATE_CLOUDY)
+    for which, rng, ks in requests:
+        msgs = split_messages(get(prs if which == "prs" else sfc, rng))
+        if len(msgs) != len(ks):
+            raise ValueError(f"wind: asked for {len(ks)} messages, got {len(msgs)}")
+        for key, raw in zip(ks, msgs):
+            g = eccodes.codes_new_from_message(raw)
+            try:
+                if key is None:                  # ABSV: identified by parameter, never decoded
+                    _check_absv(g)
+                    continue
+                lev, comp = key
+                _check_layer_message(g, lev, comp)
+                if "lat" not in out:
+                    out["lat"], out["lon"], turn = _wind_geometry(g)
+                vals = eccodes.codes_get_values(g)
+                miss = eccodes.codes_get(g, "missingValue")
+            finally:
+                eccodes.codes_release(g)
+            if vals.shape != out["lat"].shape:
+                raise ValueError(f"wind: {comp} {lev} has {vals.size} cells, the grid has {out['lat'].size}")
+            vals = np.where(np.isclose(vals, miss), np.nan, vals)
+            if lev == "sfc":
+                ps = vals / 100.0
+            elif comp in ("u", "v"):
+                uv.setdefault(lev, {})[comp] = vals.astype(np.float32)
+            else:
+                # cloud water + ice; a missing part counts as none, both missing is clear
+                part = np.where(np.isnan(vals), 0.0, vals).astype(np.float32)
+                have, acc = cond.get(lev, (0, None))
+                acc = part if acc is None else acc + part
+                cond[lev] = (have + 1, acc)
+                if have + 1 == 2 and not keep_condensate:
+                    cond[lev] = (2, acc >= layerwind.CONDENSATE_CLOUDY)
     levels = list(RRFS_WIND_LEVELS)      # descending: the order deck_winds is happiest with
     u, v = [], []
     for lev in levels:

@@ -155,9 +155,9 @@ def test_cli_builds_a_sample_and_rate_limits_every_request(tmp_path, monkeypatch
     m = json.loads((tmp_path / "manifest.json").read_text())
     assert len(m["stepsMs"]) == 2 and m["complete"] is False
     assert "wind" in m and (tmp_path / "wind" / "2026110912").is_dir()
-    # cover: one idx and four ranges an hour; wind: two idx and 37 ranges (an hour's U+V and CLMR+ICMR rows touch in
-    # pairs: 36 prslev ranges, plus PRES surface); all counted
-    assert n["acquired"] == len(f.calls) == 2 * (5 + 39)
+    # cover: one idx and four ranges an hour; wind (hours 0 and 3 are both wind hours): two idx, one range a level
+    # (18) and PRES surface = 21; all counted
+    assert n["acquired"] == len(f.calls) == 2 * (5 + 21)
 
 
 def test_cli_failed_build_exits_1(tmp_path, monkeypatch):
