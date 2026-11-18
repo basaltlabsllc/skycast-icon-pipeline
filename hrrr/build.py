@@ -11,8 +11,10 @@
 # cover without a "thick" key rather than failing (run_build.build_thick's rule).
 #
 # Wind: wind/<YYYYMMDDHH>/<group>.icw (ICW1, pipeline/wind.py), u/v at
-# 850/500/250 hPa on a 1 degree lattice, turned from HRRR's grid-relative
-# components to east/north, over the same hours. A failure or running past
+# per deck (keys 850/500/250 = low/mid/high) on a 1 degree lattice, each deck's
+# wind being the mean over HRRR's own cloud layer (manifest layer "cloud",
+# hrrr/grib.py read_layer_wind), turned from HRRR's grid-relative components to
+# east/north, over the same hours. A failure or running past
 # WIND_BUDGET_S drops the "wind" key and files; the cover is published anyway.
 import concurrent.futures as cf
 import datetime as dt
@@ -30,7 +32,7 @@ from pipeline.encode import encode_square
 from pipeline.site import build_manifest, thick_path, tiles_path, wind_path
 from pipeline.squares import SIDE, parse_name
 
-from .grib import FIELDS, file_url, read_fields, read_thick, read_wind
+from .grib import FIELDS, file_url, read_fields, read_thick, read_layer_wind
 from .grid import SQUARES, bin_index, box_average, box_mean
 
 RETRIES = 2          # extra attempts per forecast hour
@@ -120,7 +122,7 @@ def build_thick(run, out_dir, get, sleep, fhs, bins, workers):
 def _read_wind_step(run, fh, get, sleep):
     for attempt in range(RETRIES + 1):
         try:
-            return read_wind(run, fh, get)
+            return read_layer_wind(run, fh, get)
         except Exception:
             if attempt == RETRIES:
                 raise
@@ -173,7 +175,7 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
         shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
         return None
     print(f"wind: {groups} groups, {len(fhs)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
-    return wind.manifest_entry(run)
+    return wind.manifest_entry(run, layer="cloud")
 
 
 def build(run, out_dir, get, now, sleep=time.sleep, fhs=None, clock=time.monotonic):
