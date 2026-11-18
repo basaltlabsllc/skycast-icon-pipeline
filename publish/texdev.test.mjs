@@ -98,3 +98,58 @@ test('publish: a failed delete leaves the new manifest live and reports, never t
   assert.ok(s.have.has(MANIFEST));
   assert.ok(logs.some((l) => l.startsWith('::warning::')));
 });
+
+// ---- Cloud heights (ICH1): files beside the clue files, handled exactly like them ----
+
+const NEW_H = [...NEW, 'texdev/heights/2026111212/N40W125.ich'];
+const OLD_H = [...OLD, 'texdev/heights/2026111206/N40W125.ich'];
+
+test('the plan: height files upload with the run and the previous run\'s are deleted, like the clue files', () => {
+  const plan = planTexdev(NEW_H, OLD_H);
+  assert.deepEqual(plan.uploads, NEW_H.filter((p) => p !== MANIFEST));
+  assert.equal(plan.manifest, MANIFEST);
+  assert.deepEqual(plan.deletes, OLD_H.filter((p) => p !== MANIFEST));
+  assert.deepEqual(planTexdev(NEW_H, NEW_H).deletes, []);
+});
+
+test('the plan refuses a height file outside texdev/', () => {
+  for (const bad of ['heights/2026111212/N40W125.ich', 'texdev/../heights/2026111212/N40W125.ich']) {
+    assert.throws(() => planTexdev([...NEW, bad], []), /outside texdev\//, bad);
+  }
+  assert.throws(() => planTexdev(NEW_H, ['heights/2026111206/N40W125.ich']), /outside texdev\//);
+});
+
+test('publish: height files go up under texdev/ before the manifest and the old run\'s go after it; the live feed is untouched', async () => {
+  const live = ['manifest.json', 'tiles/2026111206/N40W125.icl', 'columns/2026111206/N40W125.icc', 'heights/2026111206/N40W125.ich'];
+  const s = store([...live, ...OLD_H]);
+  const r = await publishTexdev({ outDir: await outDir(NEW_H), put: s.put, list: s.list, del: s.del, retry, log: () => {} });
+  assert.equal(r.ok, true);
+  const puts = s.calls.filter((c) => c[0] === 'put').map((c) => c[1]);
+  const dels = s.calls.filter((c) => c[0] === 'del').map((c) => c[1]);
+  assert.ok([...puts, ...dels].every((p) => p.startsWith(PREFIX)));
+  assert.deepEqual(new Set(puts), new Set(NEW_H));
+  assert.equal(puts.at(-1), MANIFEST);
+  const manifestAt = s.calls.findIndex((c) => c[0] === 'put' && c[1] === MANIFEST);
+  assert.ok(s.calls.every((c, i) => c[0] !== 'del' || i > manifestAt));
+  assert.deepEqual(dels.sort(), OLD_H.filter((p) => p !== MANIFEST).sort());
+  assert.ok(s.calls.filter((c) => c[0] === 'list').every((c) => c[1] === PREFIX));
+  for (const p of live) assert.ok(s.have.has(p), p);
+  const opts = Object.fromEntries(s.calls.filter((c) => c[0] === 'put').map((c) => [c[1], c[2]]));
+  assert.equal(opts[NEW_H.at(-1)].cacheControlMaxAge, 365 * 24 * 3600);
+  assert.deepEqual([...s.have].filter((p) => p.startsWith(PREFIX)).sort(), [...NEW_H].sort());
+});
+
+test('publish: a run built without heights removes the previous run\'s height files with its other files', async () => {
+  // Its manifest has no "heights" key, so nothing may still point at them.
+  const s = store(OLD_H);
+  const r = await publishTexdev({ outDir: await outDir(NEW), put: s.put, list: s.list, del: s.del, retry, log: () => {} });
+  assert.equal(r.ok, true);
+  assert.deepEqual([...s.have].sort(), [...NEW].sort());
+});
+
+test('publish: a run with heights after one without uploads them and deletes only the old run', async () => {
+  const s = store(OLD);
+  const r = await publishTexdev({ outDir: await outDir(NEW_H), put: s.put, list: s.list, del: s.del, retry, log: () => {} });
+  assert.equal(r.ok, true);
+  assert.deepEqual([...s.have].sort(), [...NEW_H].sort());
+});
