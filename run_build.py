@@ -22,7 +22,7 @@ from collections import namedtuple
 from pathlib import Path
 import numpy as np
 
-from pipeline import blocks, cluefile, clues, columns, dwd, history, live, site, thick
+from pipeline import blocks, cluefile, clues, columns, dwd, heights, history, live, site, thick
 from pipeline.encode import encode_square, quantize, FIELD_COUNT
 from pipeline.regrid import ensure_kit, regrid, lattice_levels, regrid_values
 from pipeline.squares import all_squares, parse_name, slice_square, NX, NY
@@ -773,26 +773,31 @@ def _local_nodes(name, stride, window):
     return np.asarray(r) - window[0], np.asarray(c) - window[2]
 
 
-def _window_tag(window, stride):
-    return json.dumps({"window": list(window), "stride": stride})
+def _window_tag(window, stride, rule=None):
+    """`rule`: what else the kept heads depend on (the cloud heights' threshold
+    and levels); None for the upper air and the columns, whose tag is as ever."""
+    tag = {"window": list(window), "stride": stride}
+    if rule is not None:
+        tag["rule"] = rule
+    return json.dumps(tag)
 
 
-def _windowed_history(state, run, sub, window, stride, shape):
+def _windowed_history(state, run, sub, window, stride, shape, rule=None):
     """history.load_history_steps, but only from heads kept for this window."""
     tag = history.history_dir(state, sub) / "window.json"
-    if not tag.exists() or tag.read_text() != _window_tag(window, stride):
+    if not tag.exists() or tag.read_text() != _window_tag(window, stride, rule):
         return []
     return history.load_history_steps(state, run, sub=sub, shape=shape)
 
 
-def _save_windowed_head(state, run, sub, window, stride, head):
+def _save_windowed_head(state, run, sub, window, stride, head, dtype=np.uint16, split=True, rule=None):
     d = history.history_dir(state, sub)
     tag = d / "window.json"
-    if tag.exists() and tag.read_text() != _window_tag(window, stride):
+    if tag.exists() and tag.read_text() != _window_tag(window, stride, rule):
         for p in d.glob("*.npz"):            # another window's heads: unreadable now
             p.unlink()
-    history.save_run_head(state, run, head, sub=sub, dtype=np.uint16, split=True)
-    tag.write_text(_window_tag(window, stride))
+    history.save_run_head(state, run, head, sub=sub, dtype=dtype, split=split)
+    tag.write_text(_window_tag(window, stride, rule))
     history.prune(state, dwd.run_id(run), sub=sub)
 
 
@@ -1040,6 +1045,174 @@ def build_upper_and_clues(blob_dir, state, work, deps, kit, run, steps, squares,
           f"(clues {time.monotonic() - t1:.0f} s, {clue_workers()} workers on {os.cpu_count()} cores)")
     return (_tex_entry("ICU1", run, hours, len(past_up), stride, site.upper_path(run)),
             _tex_entry(cluefile.FORMAT, run, hours, len(past_up), stride, site.clues_path(run)))
+
+
+# ---- Cloud heights (ICH1, pipeline/heights.py) -------------------------------
+# Each deck's real base and top from CLC on model levels and HHL, one file per
+# square beside the clue files, on the clue files' hours. They are an extra:
+# nothing here may cost a run its upper air or clues, so build_heights never
+# raises, never waits for DWD, and stops when its time is up.
+#
+# Time. Measured on the 4-core runner with the same 16 fetch threads
+# (tools/measure_heights.py, 2026-11-17): 9.3 min a run to download and remap
+# the 3,255 CLC files (6.07 GB) plus 55 s for the 36 HHL files. The budget is
+# three times that; texdev_build shortens it to what the job has left.
+HEIGHTS_BUDGET_S = 30 * 60
+HEIGHTS_SUB = "heights"
+
+
+def site_heights_root():
+    return "heights"
+
+
+class _OutOfTime(Exception):
+    pass
+
+
+def _heights_rule():
+    """What a kept head of heights depends on besides the window."""
+    return {"format": heights.FORMAT, "threshold": heights.CLC_THRESHOLD_PCT,
+            "levels": [dwd.HEIGHT_MLEVELS[0], dwd.HEIGHT_MLEVELS[-1]], "stepM": heights.HEIGHT_STEP_M}
+
+
+def _height_level(deps, kit, work, run, field, name, stride, window, check):
+    check()
+    return _crop(_only(_fetch_levels(deps, kit, work, [name], run, field, stride)), window)
+
+
+def height_statics(deps, kit, work, run, stride, window, pool, check):
+    """(hhl float32 [36][R][C], the highest half level first; deck masks) —
+    once per run. Raises unless every node's heights fall with the level."""
+    names = [dwd.invariant_file_name(run, "HHL", lv) for lv in dwd.HEIGHT_HHL_LEVELS]
+    # One cdo call each: no level axis to trust.
+    futs = [pool.submit(_height_level, deps, kit, work, run, "HHL", n, stride, window, check) for n in names]
+    hhl = np.stack([f.result() for f in futs]).astype(np.float32)
+    with np.errstate(invalid="ignore"):
+        rising = np.diff(hhl, axis=0) >= 0                      # NaN compares False
+    if rising.any():
+        k = int(np.argmax(rising.any(axis=tuple(range(1, hhl.ndim)))))
+        raise ValueError(f"HHL does not fall from half level {dwd.HEIGHT_HHL_LEVELS[k]} to "
+                         f"{dwd.HEIGHT_HHL_LEVELS[k + 1]} at {int(rising[k].sum())} nodes")
+    return hhl, heights.deck_masks(hhl)
+
+
+def height_step(deps, kit, work, run, step, stride, window, hhl, masks, threshold, check):
+    """One step's five bytes a node: u8 [5][R][C], cropped to `window`."""
+    clc = np.stack([_height_level(deps, kit, work, run, "CLC", dwd.model_file_name(run, step, lv, "CLC"),
+                                  stride, window, check)
+                    for lv in dwd.HEIGHT_MLEVELS])              # one cdo call each, as above
+    return heights.height_record(clc, hhl, threshold, masks)
+
+
+def fetch_heights(deps, kit, work, run, steps, workers, stride, window, check):
+    """[(unix hour, u8 [5][R][C])] in time order. Any file that fails, or
+    `check` raising (out of time), fails the whole fetch: the steps not yet
+    started are dropped and the ones in flight stop at their next file."""
+    stop = threading.Event()
+
+    def checked():
+        if stop.is_set():
+            raise _OutOfTime("stopped: another step failed")
+        check()
+
+    threshold = heights.CLC_THRESHOLD_PCT
+    base = history.hour_of(run)
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        try:
+            hhl, masks = height_statics(deps, kit, work, run, stride, window, pool, checked)
+            futs = {pool.submit(height_step, deps, kit, work, run, s, stride, window, hhl, masks, threshold,
+                                checked): s for s in steps}
+            got = {}
+            for fut in cf.as_completed(futs):
+                got[futs[fut]] = fut.result()
+        except BaseException:
+            stop.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+    return [(base + s, got[s]) for s in steps]
+
+
+def write_heights(blob_dir, run, names, stride, window, stacks, workers=1):
+    """One .ich per square under heights/<run>/; returns the bytes written."""
+    hours = [h for h, _ in stacks]
+    tiles = Path(blob_dir) / site.heights_path(run)
+    tiles.mkdir(parents=True, exist_ok=True)
+    spacing = int(round(columns.spacing_deg(stride) * 1000))
+
+    def one(name):
+        lat, lon = parse_name(name)
+        rr, cc = _local_nodes(name, stride, window)
+        cube = np.stack([b[:, rr][:, :, cc] for _, b in stacks])           # [steps][5][rows][cols]
+        data = heights.encode_height_square(lat, lon, spacing, hours, np.ascontiguousarray(np.moveaxis(cube, 1, 3)))
+        (tiles / f"{name}.ich").write_bytes(data)
+        return len(data)
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        return sum(pool.map(one, names))
+
+
+def _whole(x):
+    return int(x) if float(x).is_integer() else float(x)
+
+
+def build_heights(blob_dir, state, work, deps, kit, run, steps, squares, hours, workers, stride=None,
+                  budget_s=HEIGHTS_BUDGET_S, clock=time.monotonic):
+    """The cloud-height (ICH1) files of `squares` under heights/<run>/, on
+    `hours` (the clue files' unix hours, history first): the run's own steps
+    read from DWD, earlier hours from the heads kept under state/<HEIGHTS_SUB>
+    (history.py, as the upper air's), and any hour neither has marked UNKNOWN.
+    Returns the manifest entry, or None with a warning and nothing written —
+    a file DWD does not list (no waiting), any error, or `budget_s` seconds
+    passing on `clock` before the last file is read. Never raises."""
+    stride = stride or UPPER_STRIDE
+    t0 = clock()
+    names = list(squares)
+
+    def check():
+        if clock() - t0 > budget_s:
+            raise _OutOfTime(f"out of time: {budget_s / 60:.0f} min were allowed")
+
+    try:
+        if budget_s <= 0:
+            print(f"::warning::heights skipped: no time left in the job ({budget_s / 60:.0f} min)")
+            return None
+        missing = dwd.missing_height_files(deps.listing, run, steps)
+        if missing:
+            print(f"::warning::heights skipped: {len(missing)} files of run {dwd.run_iso(run)} not listed "
+                  f"on DWD (first: {missing[0]})")
+            return None
+        window = square_window(names, stride)
+        crop_shape = (window[1] - window[0], window[3] - window[2])
+        rule = _heights_rule()
+        base = history.hour_of(run)
+        own = fetch_heights(deps, kit, work, run, steps, column_fetch_workers(), stride, window, check)
+        t1 = clock()
+        by = dict(_windowed_history(state, run, HEIGHTS_SUB, window, stride, (heights.N_BYTES,) + crop_shape, rule))
+        n_kept = len(by)
+        by.update(own)
+        hours = [int(h) for h in hours]
+        gap = [h for h in hours if h not in by]
+        blank = heights.unknown_record(crop_shape)
+        stacks = [(h, by.get(h, blank)) for h in hours]
+        total = write_heights(blob_dir, run, names, stride, window, stacks, workers)
+        head_steps = [s for s in range(history.HEAD_STEPS) if s in steps]
+        if len(head_steps) == history.HEAD_STEPS:
+            own_by = dict(own)
+            _save_windowed_head(state, run, HEIGHTS_SUB, window, stride,
+                                np.stack([own_by[base + s] for s in head_steps]), dtype=np.uint8, split=False,
+                                rule=rule)
+    except Exception as e:
+        print(f"::warning::heights failed: {type(e).__name__}: {e}")
+        shutil.rmtree(Path(blob_dir) / site_heights_root(), ignore_errors=True)
+        return None
+    print(f"heights: {len(names)} squares, {len(hours)} steps ({n_kept} kept from earlier runs, "
+          f"{len(gap)} unknown), {heights.FORMAT} {total / 1e6:.1f} MB, {clock() - t0:.0f} s "
+          f"(fetch {t1 - t0:.0f} s) of {budget_s:.0f} s allowed")
+    entry = _tex_entry(heights.FORMAT, run, hours, sum(1 for h in hours if h < base), stride, site.heights_path(run))
+    entry.update({"threshold": _whole(rule["threshold"]), "levels": rule["levels"], "stepM": _whole(rule["stepM"]),
+                  "bytes": heights.N_BYTES, "noLevel": heights.NO_LEVEL, "unknown": heights.UNKNOWN,
+                  "topAtReachFlag": heights.FLAG_TOP_AT_REACH})
+    return entry
 
 
 def main():

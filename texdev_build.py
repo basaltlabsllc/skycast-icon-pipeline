@@ -6,7 +6,11 @@
 # for its column and upper-air files the same way, and writes
 #   <out>/texdev/upper/<run>/<square>.icu
 #   <out>/texdev/clues/<run>/<square>.icx
-#   <out>/texdev/manifest.json   {run, runMs, builtMs, squares, upper, clues}
+#   <out>/texdev/heights/<run>/<square>.ich   (cloud heights, when they could be built)
+#   <out>/texdev/manifest.json   {run, runMs, builtMs, squares, upper, clues[, heights]}
+# The heights (ICH1, pipeline/heights.py: each deck's real base and top) are an
+# extra beside the clue files, which they never change: the manifest's
+# "heights" key is there only when the run's height files were written.
 # The clues entry's "format" names the files' magic ("ICX2": 30 bytes a node,
 # with each deck's wind direction; "ICX1" before it had 27). The app reads the
 # magic of each file, so a feed of either kind loads.
@@ -15,7 +19,9 @@
 # state/texdev_columns (the column heads the clue history is rebuilt from).
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import run_build
@@ -47,14 +53,44 @@ PREFIX = "texdev"
 COLUMN_SUB = "texdev_columns"
 
 
-def manifest(run, built, names, upper, clues):
-    return json.dumps({"run": dwd.run_iso(run), "runMs": int(run.timestamp() * 1000),
-                       "builtMs": int(built.timestamp() * 1000), "squares": sorted(names),
-                       "upper": upper, "clues": clues, "attribution": run_build.site.ATTRIBUTION},
-                      separators=(",", ":"))
+# The job's time limit (.github/workflows/texdev.yml, timeout-minutes) and what
+# the cloud heights must leave of it. The reserve is for what follows them: a
+# download already in flight when their time ends (run_build._download gives
+# one file up to 4 tries of 120 s), then writing, the publish and the state
+# push (under 2 min together in the five newest runs, read 2026-11-17). Those
+# runs took 57 to 149 min of the 150, so the heights' own budget is not
+# enough by itself: one of them would have had a minute.
+JOB_LIMIT_S = 150 * 60
+JOB_RESERVE_S = 15 * 60
+JOB_START_ENV = "TEXDEV_JOB_START"       # unix seconds, set by the workflow's second step
 
 
-def build(out, state, work, deps, steps=None, workers=None, squares=None):
+def job_start(env, fallback):
+    try:
+        return float(int(env.get(JOB_START_ENV, "")))
+    except ValueError:
+        return float(fallback)
+
+
+def heights_budget(job_start_s, now_s):
+    """Seconds the cloud heights may take: their own budget, or what the job
+    has left before its reserve when that is less (zero or under: none)."""
+    return min(run_build.HEIGHTS_BUDGET_S, job_start_s + JOB_LIMIT_S - JOB_RESERVE_S - now_s)
+
+
+def manifest(run, built, names, upper, clues, heights=None):
+    out = {"run": dwd.run_iso(run), "runMs": int(run.timestamp() * 1000),
+           "builtMs": int(built.timestamp() * 1000), "squares": sorted(names),
+           "upper": upper, "clues": clues, "attribution": run_build.site.ATTRIBUTION}
+    if heights is not None:
+        # Absent, never null, when a run has no height files: a reader that
+        # finds the key can rely on the files.
+        out["heights"] = heights
+    return json.dumps(out, separators=(",", ":"))
+
+
+def build(out, state, work, deps, steps=None, workers=None, squares=None, env=None, clock=time.time):
+    began = job_start(os.environ if env is None else env, clock())
     run = dwd.newest_complete_run(deps.listing)
     if run is None:
         print("no complete run on DWD yet")
@@ -71,7 +107,14 @@ def build(out, state, work, deps, steps=None, workers=None, squares=None):
     if upper is None or clues is None:
         print(f"::error::texdev: run {dwd.run_iso(run)} built no upper air — nothing published")
         return run_build.FAILED
-    (root / "manifest.json").write_text(manifest(run, deps.now(), names, upper, clues))
+    # The cloud heights come last and are an extra: whatever happens to them,
+    # the files above are already written and the manifest names them.
+    budget = heights_budget(began, clock())
+    print(f"texdev: heights may take {budget / 60:.0f} min ({(clock() - began) / 60:.0f} min of the job's "
+          f"{JOB_LIMIT_S // 60} used)")
+    heights = run_build.build_heights(root, Path(state), work, deps, kit, run, steps, names,
+                                      [ms // 3600000 for ms in clues["steps"]], workers, budget_s=budget)
+    (root / "manifest.json").write_text(manifest(run, deps.now(), names, upper, clues, heights))
     return run_build.BUILT
 
 

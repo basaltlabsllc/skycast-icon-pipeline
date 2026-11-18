@@ -187,3 +187,29 @@ def missing_upper_files(listing, run, steps):
         html = listing(hh, field) or ""
         missing += [n for n in names if n not in html]
     return missing
+
+
+# ---- Cloud heights (pipeline/heights.py, the ICH1 file) ----------------------
+# Cloud cover on model levels (CLC, %) from the ground to 5 km above it, and
+# the half-level heights (HHL, m above sea level) that bound those levels.
+# Full levels 86-120 (120 is the lowest); half level 121 is the ground. Chosen
+# from DWD's HHL by tools/measure_heights.py (2026-11-17): the fewest lowest
+# levels whose top is 5 km above ground at 99 % of the feed's nodes.
+HEIGHT_MLEVELS = list(range(86, 121))
+HEIGHT_HHL_LEVELS = list(range(86, 122))             # bounds of those full levels
+
+
+def height_files(run, steps):
+    """{directory field: [file names]} — every file one cloud-height build reads."""
+    return {"HHL": [invariant_file_name(run, "HHL", lv) for lv in HEIGHT_HHL_LEVELS],
+            "CLC": [model_file_name(run, s, lv, "CLC") for s in steps for lv in HEIGHT_MLEVELS]}
+
+
+def missing_height_files(listing, run, steps):
+    """`listing(hh, field) -> html`. The cloud-height files of `run` not listed yet."""
+    hh = f"{run:%H}"
+    missing = []
+    for field, names in height_files(run, steps).items():
+        html = listing(hh, field) or ""
+        missing += [n for n in names if n not in html]
+    return missing

@@ -38,6 +38,10 @@ def clues_path(run):
     return f"clues/{run_id(run)}"
 
 
+def heights_path(run):
+    return f"heights/{run_id(run)}"
+
+
 def build_manifest(run, built, step_hours, squares, history_hours, complete=True, tail=None, columns=None,
                    blocks=None, thick=None, repairs=0):
     out = {
