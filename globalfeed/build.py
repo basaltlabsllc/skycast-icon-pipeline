@@ -287,7 +287,7 @@ def build_wind(model, run, out_dir, get, sleep, budget_s=WIND_BUDGET_S, clock=ti
         shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
         return None
     print(f"wind: {groups} groups, {len(steps)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
-    return wind.manifest_entry(run)
+    return wind.manifest_entry(run, model.wind_layer)
 
 
 def build(model, run, out_dir, get, now, state, sleep=time.sleep, steps=None, clock=time.monotonic):

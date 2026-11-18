@@ -15,27 +15,54 @@ RUN = datetime(2026, 11, 8, 0, tzinfo=UTC)
 NOW = datetime(2026, 11, 8, 5, 10, tzinfo=UTC)
 
 
-def _ncep_idx():
-    rows = ["1:0:d=2026110800:HGT:850 mb:6 hour fcst:",
-            "2:100:d=2026110800:UGRD:850 mb:6 hour fcst:",
-            "3:250:d=2026110800:VGRD:850 mb:6 hour fcst:",
-            "4:400:d=2026110800:UGRD:500 mb:6 hour fcst:",
-            "5:520:d=2026110800:VGRD:500 mb:6 hour fcst:",
-            "6:700:d=2026110800:UGRD:250 mb:6 hour fcst:",
-            "7:830:d=2026110800:VGRD:250 mb:6 hour fcst:",
-            "8:960:d=2026110800:UGRD:250 mb:anl:"]
-    return "\n".join(rows)
+GFS_LEVELS = (1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150)
 
 
-def test_ncep_wind_ranges():
-    r = grib.wind_ranges(GFS, _ncep_idx(), 6)
-    assert r[(850, "u")] == (100, 249) and r[(850, "v")] == (250, 399)
-    assert r[(500, "u")] == (400, 519) and r[(500, "v")] == (520, 699)
-    assert r[(250, "u")] == (700, 829) and r[(250, "v")] == (830, 959)
+def _ncep_rows(levels=GFS_LEVELS, fh=6, skip=()):
+    """(name, level text, forecast text) rows in a GFS idx's order; `skip` drops a (name, level)."""
+    want = "anl" if fh == 0 else f"{fh} hour fcst"
+    rows = [("HGT", "850 mb", want)]
+    for lev in levels:
+        for name in ("UGRD", "VGRD", "TCDC"):
+            rows.append((name, f"{lev} mb", want))
+    rows.append(("UGRD", "100 mb", want))          # above 150: never asked for
+    rows.append(("PRES", "surface", want))
+    rows.append(("UGRD", "250 mb", "anl"))          # another forecast hour's row
+    return [r for r in rows if (r[0], r[1]) not in skip]
+
+
+def _ncep_idx(levels=GFS_LEVELS, fh=6, skip=()):
+    return "\n".join(f"{i + 1}:{i * 100}:d=2026110800:{n}:{lv}:{f}:"
+                      for i, (n, lv, f) in enumerate(_ncep_rows(levels, fh, skip)))
+
+
+def test_gfs_ranges_cover_every_deck_level():
+    idx = _ncep_idx()
+    rows = _ncep_rows()
+    r = grib.wind_ranges(GFS, idx, 6)
+    assert len(r) == 3 * len(GFS_LEVELS) + 1
+    for lev in GFS_LEVELS:
+        for comp, name in (("u", "UGRD"), ("v", "VGRD"), ("tcdc", "TCDC")):
+            k = rows.index((name, f"{lev} mb", "6 hour fcst"))
+            assert r[(lev, comp)] == (k * 100, (k + 1) * 100 - 1), (lev, comp)
+    k = rows.index(("PRES", "surface", "6 hour fcst"))
+    assert r[("sfc", "pres")] == (k * 100, (k + 1) * 100 - 1)
+    assert (100, "u") not in r                      # 100 mb is above every deck
     with pytest.raises(KeyError):
-        grib.wind_ranges(GFS, _ncep_idx(), 12)
+        grib.wind_ranges(GFS, idx, 12)
+
+
+def test_gfs_missing_tcdc_row_raises_keyerror():
+    for skip in ((("TCDC", "700 mb"),), (("VGRD", "500 mb"),), (("PRES", "surface"),)):
+        with pytest.raises(KeyError):
+            grib.wind_ranges(GFS, _ncep_idx(skip=skip), 6)
     with pytest.raises(KeyError):
         grib.wind_ranges(GFS, "\n".join(_ncep_idx().split("\n")[:5]), 6)
+
+
+def test_gfs_anl_rows_at_f000():
+    r = grib.wind_ranges(GFS, _ncep_idx(fh=0), 0)
+    assert (850, "tcdc") in r and ("sfc", "pres") in r
 
 
 def _row(param, levtype, lev, off, ln):
@@ -180,6 +207,7 @@ def test_wind_skipped_when_no_time_left(monkeypatch, tmp_path, capsys):
 
 def test_wind_flags():
     assert GFS.wind and AIFS.wind and IFS.wind
+    assert GFS.wind_layer == "cloud" and AIFS.wind_layer is None and IFS.wind_layer is None
 
 
 def _wind_msg(comp, lev, val):
@@ -229,3 +257,80 @@ def test_read_wind_step_rejects_swapped_message():
     get, _ = _ifs_order_fixture(swap=True)
     with pytest.raises(ValueError, match="expected u 500"):
         grib.read_wind_step(IFS, RUN, 6, get)
+
+
+def _gfs_msg(kind, lev, vals):
+    """A 2 x 2 GRIB2 message: kind 'u' | 'v' | 'tcdc' on `lev` hPa, or 'pres' at the surface (Pa)."""
+    import eccodes
+    if kind == "pres":
+        h = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+        spec = (("parameterCategory", 3), ("parameterNumber", 0), ("typeOfFirstFixedSurface", 1),
+                ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", 0))
+    else:
+        h = eccodes.codes_grib_new_from_samples("regular_ll_pl_grib2")
+        cat, num = {"u": (2, 2), "v": (2, 3), "tcdc": (6, 1)}[kind]
+        spec = (("parameterCategory", cat), ("parameterNumber", num), ("typeOfFirstFixedSurface", 100),
+                ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", lev * 100))
+    for k, v in (("Ni", 2), ("Nj", 2), ("latitudeOfFirstGridPointInDegrees", 41.0),
+                 ("latitudeOfLastGridPointInDegrees", 40.0), ("longitudeOfFirstGridPointInDegrees", 250.0),
+                 ("longitudeOfLastGridPointInDegrees", 251.0), ("iDirectionIncrementInDegrees", 1.0),
+                 ("jDirectionIncrementInDegrees", 1.0), ("bitsPerValue", 24), ("discipline", 0)) + spec:
+        eccodes.codes_set(h, k, v)
+    eccodes.codes_set_values(h, np.array(vals, dtype=float))
+    b = eccodes.codes_get_message(h)
+    eccodes.codes_release(h)
+    return b
+
+
+def _gfs_fixture(u_of, tcdc_of, ps_pa, levels=(1000, 850, 700, 600, 500, 300, 250, 150)):
+    """A GFS file with the 2 x 2 fields below, in idx order, and a get() serving it."""
+    rows, buf, parts = [], b"", []
+    for lev in levels:
+        for kind, name in (("u", "UGRD"), ("v", "VGRD"), ("tcdc", "TCDC")):
+            val = {"u": u_of(lev), "v": -1.0, "tcdc": tcdc_of(lev)}[kind]
+            parts.append((name, f"{lev} mb", _gfs_msg(kind, lev, [val] * 4)))
+    parts.append(("PRES", "surface", _gfs_msg("pres", 0, ps_pa)))
+    for i, (name, lev, m) in enumerate(parts):
+        rows.append(f"{i + 1}:{len(buf)}:d=2026110800:{name}:{lev}:6 hour fcst:")
+        buf += m
+    idx = "\n".join(rows)
+
+    def get(url, rng=None):
+        if url.endswith(".idx"):
+            return idx.encode()
+        return buf[rng[0]:(None if rng[1] is None else rng[1] + 1)]
+    return get
+
+
+def test_gfs_read_wind_step_returns_deck_layer_winds():
+    from pipeline import layerwind
+    levels = (1000, 850, 700, 600, 500, 300, 250, 150)
+    u_of = lambda lev: lev / 10.0
+    cloudy = {700, 600}                        # one cloudy run, in the low and mid decks
+    get = _gfs_fixture(u_of, lambda lev: 80.0 if lev in cloudy else 1.0, [101300.0, 101300.0, 60000.0, 60000.0])
+    out = grib.read_wind_step(GFS, RUN, 6, get)
+    assert sorted(k for k in out if k not in ("lat", "lon")) == sorted((l, c) for l in (850, 500, 250) for c in "uv")
+    assert out[(850, "u")].shape == (2, 2)
+    # the expected values from Task 1's core, run by hand on the same column
+    for pt, ps in ((0, 1013.0), (2, 600.0)):
+        p = np.array(levels, float)
+        want = layerwind.deck_winds(p, [np.array([u_of(l)]) for l in levels], [np.array([-1.0])] * len(levels),
+                                    [np.array([l in cloudy]) for l in levels], np.array([ps]),
+                                    layerwind.deck_bounds("ncep", np.array([ps])))
+        for key in (850, 500, 250):
+            for c in "uv":
+                got, w = out[(key, c)].reshape(-1)[pt], want[(key, c)][0]
+                assert (np.isnan(got) and np.isnan(w)) or got == pytest.approx(w, rel=1e-5), (pt, key, c)
+    # at the 1013 hPa points 700 mb is the low deck's only cloudy level and 600 mb the mid deck's
+    assert out[(850, "u")][0, 0] == pytest.approx(70.0)
+    assert out[(500, "u")][0, 0] == pytest.approx(60.0)
+    # at ps = 600 hPa the whole low deck (600..642) is underground: NaN, not 0
+    assert np.isnan(out[(850, "u")][1, 0]) and out[(500, "u")][1, 0] == pytest.approx(60.0)
+
+
+def test_gfs_read_wind_step_rejects_swapped_message():
+    get = _gfs_fixture(lambda lev: 1.0, lambda lev: 1.0, [101300.0] * 4)
+    idx = (get("x.idx").decode().replace("UGRD:850 mb", "@:850 mb").replace("VGRD:850 mb", "UGRD:850 mb")
+           .replace("@:850 mb", "VGRD:850 mb"))                              # the idx swaps 850 mb u and v
+    with pytest.raises(ValueError, match="expected . 850"):
+        grib.read_wind_step(GFS, RUN, 6, lambda u, r=None: idx.encode() if u.endswith(".idx") else get(u, r))
