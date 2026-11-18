@@ -4,15 +4,21 @@ name: texdev
 # with Alaska and Hawaii, and Iceland) of the newest ICON run, published under
 # texdev/ in the ICON feed's Blob store and nowhere else.
 #
-# The cloud heights are an extra: when DWD does not list their files, anything
-# fails or their time runs out, the run publishes without them and its
-# manifest has no "heights" key (run_build.build_heights). The build is told
-# when the job began (TEXDEV_JOB_START) so they stop in time for the publish
-# to finish inside timeout-minutes; texdev_build.JOB_LIMIT_S is that limit.
+# The cloud heights are an extra, built in a process of their own: when DWD
+# does not list their files, anything fails or their time runs out, the run
+# publishes without them and its manifest has no "heights" key
+# (texdev_build.heights_extra). The build is told when the job began
+# (TEXDEV_JOB_START) so they stop in time for the publish to finish inside
+# timeout-minutes; texdev_build.JOB_LIMIT_S is that limit.
 #
-# Run by hand only (Actions → texdev → Run workflow, branch cloud-texture);
-# every dispatch spends Actions minutes and Blob storage. It never runs on a
-# schedule or a push, refuses any branch but cloud-texture, and:
+# This copy runs by hand (Actions → texdev → Run workflow, branch
+# cloud-texture); every dispatch spends Actions minutes and Blob storage. The
+# feed's four daily scheduled runs are fired by main's copy of this workflow,
+# which checks out and builds this branch's code (and runs this branch's
+# tests first) and does not set TEXDEV_JOB_START: the build then takes the
+# job to have begun 20 min before it did (texdev_build.PREBUILD_ALLOWANCE_S).
+# This copy has no schedule and never runs on a push, refuses any branch but
+# cloud-texture, and:
 #  - publishes with publish/texdev.mjs, which uploads and deletes only under
 #    texdev/ (never blob.mjs: that writes the live manifest.json and prunes
 #    every folder the live manifest does not name);

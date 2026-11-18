@@ -160,3 +160,17 @@ def test_the_header_names_what_the_feed_holds():
     assert "293 squares" in head and "ICH1" in head and "heights" in head
     import texdev_build
     assert len(texdev_build.TEXDEV_SQUARES) == 293
+
+
+def test_the_header_says_who_fires_the_scheduled_runs():
+    # This copy has no schedule of its own, but the feed does run on one:
+    # main's copy of this workflow fires it and builds this branch's code,
+    # without the clock step below. The header must not say otherwise.
+    head = " ".join(line.lstrip("# ").strip() for line in TEXT.split("\non:\n")[0].splitlines())
+    assert "never runs on a schedule" not in head and "Run by hand only" not in head
+    assert "scheduled runs are fired by main's copy of this workflow" in head
+    assert "does not set TEXDEV_JOB_START" in head
+    import texdev_build
+    assert f"{texdev_build.PREBUILD_ALLOWANCE_S // 60} min before" in head
+    # ... and this copy's own triggers are what they were.
+    assert [line.strip() for line in top_block(CODE, "on") if line.strip()] == ["workflow_dispatch:"]
