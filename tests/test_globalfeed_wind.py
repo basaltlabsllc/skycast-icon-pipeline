@@ -497,3 +497,104 @@ def test_gfs_pres_that_is_not_the_surface_is_rejected():
         return b if url.endswith(".idx") else b.replace(base_msg, bad)   # ranges merge touching messages
     with pytest.raises(ValueError, match="surface pressure"):
         grib.read_wind_step(GFS, RUN, 6, g)
+
+
+# ---- throttled requests on the wind path (pipeline/throttle.py) ----------------
+
+def _http_error(code, retry_after=None):
+    import email.message
+    import urllib.error
+    h = email.message.Message()
+    if retry_after is not None:
+        h["Retry-After"] = retry_after
+    return urllib.error.HTTPError("https://x/f.grib2", code, "err", h, None)
+
+
+def _scripted_get(outcomes):
+    """get() that raises / returns the scripted outcomes in order; records the calls."""
+    calls = []
+
+    def get(url, rng=None):
+        calls.append((url, rng))
+        o = outcomes.pop(0)
+        if isinstance(o, Exception):
+            raise o
+        return o
+    return get, calls
+
+
+def test_throttle_429_then_success_after_one_sleep():
+    from pipeline import throttle
+    sleeps = []
+    get, calls = _scripted_get([_http_error(429), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u", (0, 9)) == b"ok"
+    assert sleeps == [2.0] and calls == [("u", (0, 9))] * 2
+
+
+def test_throttle_honours_retry_after():
+    from pipeline import throttle
+    sleeps = []
+    get, _ = _scripted_get([_http_error(429, "7"), _http_error(503, "Wed, 18 Nov 2026 12:00:00 GMT"), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u") == b"ok"
+    assert sleeps == [7.0, 4.0]                    # a numeric Retry-After, then a date: the backoff
+    get, _ = _scripted_get([_http_error(429, "900"), b"ok"])
+    sleeps.clear()
+    throttle.retry_throttled(get, sleeps.append)("u")
+    assert sleeps == [throttle.CAP_S]              # capped
+
+
+def test_throttle_503_retries_and_404_does_not():
+    import urllib.error
+    from pipeline import throttle
+    sleeps = []
+    get, _ = _scripted_get([_http_error(503), _http_error(503), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u") == b"ok" and sleeps == [2.0, 4.0]
+    for code in (404, 403, 500):
+        sleeps.clear()
+        get, calls = _scripted_get([_http_error(code), b"never"])
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            throttle.retry_throttled(get, sleeps.append)("u")
+        assert ei.value.code == code and len(calls) == 1 and sleeps == []
+    get, calls = _scripted_get([OSError("reset"), b"never"])
+    with pytest.raises(OSError):
+        throttle.retry_throttled(get, sleeps.append)("u")
+    assert len(calls) == 1
+
+
+def test_throttle_gives_up_after_the_cap_and_at_the_deadline():
+    import urllib.error
+    from pipeline import throttle
+    sleeps = []
+    get, calls = _scripted_get([_http_error(429)] * 10)
+    with pytest.raises(urllib.error.HTTPError):
+        throttle.retry_throttled(get, sleeps.append)("u")
+    assert len(calls) == throttle.ATTEMPTS and sleeps == [2.0, 4.0, 8.0, 16.0]
+    # with the budget clock: a wait that would end past the deadline is not made
+    now = [0.0]
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+    sleeps.clear()
+    get, calls = _scripted_get([_http_error(429)] * 10)
+    with pytest.raises(urllib.error.HTTPError):
+        throttle.retry_throttled(get, sleep, clock=lambda: now[0], deadline=5.0)("u")
+    assert sleeps == [2.0] and len(calls) == 2      # 2 + 4 > 5: the third try is never made
+
+
+def test_build_wind_survives_one_429_per_request(tmp_path):
+    base = _ec_fixture(AIFS)
+    seen, sleeps = set(), []
+
+    def get(url, rng=None):
+        k = (url, rng)
+        if k not in seen:                              # every request is throttled once
+            seen.add(k)
+            raise _http_error(429)
+        return base(url, rng)
+
+    m = _small(AIFS, (0, 6))
+    e = gb.build_wind(m, RUN, tmp_path, get, sleeps.append)
+    assert e is not None and e["layer"] == "humidity"
+    assert len(sleeps) == len(seen) and set(sleeps) == {2.0}
+    assert any((tmp_path / "wind/2026110800").glob("*.icw"))

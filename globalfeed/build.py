@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline import blocks, history, pack, published, thick, wind
+from pipeline import blocks, history, pack, published, thick, throttle, wind
 from pipeline.dwd import run_id, run_iso
 from pipeline.encode import encode_square, quantize
 from pipeline.site import blocks_path, build_manifest, tail_path, thick_path, tiles_path, wind_path
@@ -252,6 +252,9 @@ def build_wind(model, run, out_dir, get, sleep, budget_s=WIND_BUDGET_S, clock=ti
     t0 = clock()
     deadline = t0 + budget_s
     steps = tuple(model.main_steps) + tuple(model.tail_steps)
+    # a step is ~20-60 ranged requests: one HTTP 429 / 503 waits and retries that
+    # request (bounded by the budget's deadline) instead of failing the step
+    get = throttle.retry_throttled(get, sleep, clock=clock, deadline=deadline)
 
     def one(fh):
         if clock() > deadline:
