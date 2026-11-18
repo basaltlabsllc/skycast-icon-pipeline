@@ -7,14 +7,18 @@ download MB and seconds.
     python tools/layerwind_control.py gfs  <YYYYMMDDHH> <fh> <lat> <lon>
     python tools/layerwind_control.py hrrr <YYYYMMDDHH> <fh> <lat> <lon>
     python tools/layerwind_control.py hrrr-threshold <YYYYMMDDHH> <fh>
+    python tools/layerwind_control.py rrfs <YYYYMMDDHH> <fh> <lat> <lon>
+    python tools/layerwind_control.py rrfs-threshold <YYYYMMDDHH> <fh>
 
-gfs / hrrr print the one node asked for plus, for HRRR, a count-only positive
+gfs / hrrr / rrfs print the one node asked for plus, for HRRR and RRFS, a count-only positive
 control (how many cells have a cloudy level, no coordinates). hrrr-threshold
-compares, per point, HRRR's lowest cloudy level with its own PRES:cloud base at
-CONDENSATE_CLOUDY candidates and prints counts and shares only.
+(and rrfs-threshold) compares, per point, the model's lowest cloudy level with its own
+PRES:cloud base at CONDENSATE_CLOUDY candidates and prints counts and shares only.
+rrfs goes through the build's own NOMADS rate limiter (90 requests a minute).
 
 Downloads with curl (byte ranges, the same ranges the build asks for); needs
-noaa-gfs-bdp-pds.s3.amazonaws.com (gfs) or noaa-hrrr-bdp-pds.s3.amazonaws.com (hrrr)."""
+noaa-gfs-bdp-pds.s3.amazonaws.com (gfs), noaa-hrrr-bdp-pds.s3.amazonaws.com (hrrr)
+or nomads.ncep.noaa.gov (rrfs)."""
 import resource
 import subprocess
 import sys
@@ -27,6 +31,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import eccodes  # noqa: E402
 import hrrr.grib as hgrib  # noqa: E402
+import rrfs.build as rbuild  # noqa: E402
+import rrfs.grib as rgrib  # noqa: E402
 from globalfeed import grib  # noqa: E402
 from globalfeed.models import GFS  # noqa: E402
 from pipeline import layerwind  # noqa: E402
@@ -43,6 +49,21 @@ def curl_get(stats):
     return get
 
 
+def rrfs_get(stats):
+    """curl_get behind the build's own NOMADS rate limiter, counting requests and the seconds the limiter held us."""
+    inner = curl_get(stats)
+    lim = rbuild.RateLimiter(rbuild.REQUESTS_PER_MINUTE)
+    stats.setdefault("waited", 0.0)
+
+    def get(url, rng=None):
+        t = time.monotonic()
+        lim.acquire()
+        stats["waited"] += time.monotonic() - t
+        stats["requests"] += 1
+        return inner(url, rng)
+    return get
+
+
 def peak_rss_mb():
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return r / 1e6 if sys.platform == "darwin" else r / 1e3
@@ -53,14 +74,14 @@ def nearest(lat, lon, lat0, lon0):
     return int(np.argmin(d))
 
 
-def hrrr_node(argv):
+def hrrr_node(argv, mod=hgrib, label="HRRR", get_factory=None, steps=49, workers=8, requests_per_step=None):
     from pipeline import wind
     run = datetime.strptime(argv[2], "%Y%m%d%H").replace(tzinfo=timezone.utc)
     fh, lat0, lon0 = int(argv[3]), float(argv[4]), float(argv[5])
-    stats = {"bytes": 0}
-    get = curl_get(stats)
+    stats = {"bytes": 0, "requests": 0}
+    get = (get_factory or curl_get)(stats)
     t0 = time.monotonic()
-    f = hgrib.read_layer_fields(run, fh, get)
+    f = mod.read_layer_fields(run, fh, get)
     t1 = time.monotonic()
     ps = f["ps"]
     bounds = layerwind.deck_bounds("ncep", ps)
@@ -69,7 +90,7 @@ def hrrr_node(argv):
     six = {k: wind.lattice_from_points(f["lat"], f["lon"], a).astype(np.float32) for k, a in decks.items()}
     t3 = time.monotonic()
     i = nearest(f["lat"], f["lon"], lat0, lon0)
-    print(f"HRRR {run:%Y-%m-%d %HZ} f{fh:03d}, node {f['lat'][i]:.2f},{f['lon'][i]:.2f}")
+    print(f"{label} {run:%Y-%m-%d %HZ} f{fh:03d}, node {f['lat'][i]:.2f},{f['lon'][i]:.2f}")
     print(f"surface pressure {ps[i]:.1f} hPa; cells {ps.size}")
     for k, lev in enumerate(f["levels"]):
         print(f"  {lev:5d} hPa  u {f['u'][k][i]:7.2f}  v {f['v'][k][i]:7.2f}  "
@@ -108,13 +129,22 @@ def hrrr_node(argv):
     print(f"download {mb:.1f} MB (2 idx + messages); download+decode+rotate {t1 - t0:.1f} s, layer rule {t2 - t1:.1f} s, "
           f"lattice x6 {t3 - t2:.1f} s, step total {t3 - t0:.1f} s; peak RSS {peak_rss_mb():.0f} MB")
     step = t3 - t0
+    if label == "RRFS":
+        n = stats["requests"]
+        floor = steps * n / rbuild.REQUESTS_PER_MINUTE * 60.0
+        print(f"requests per step: {n} (2 idx + {n - 2} ranged); wait the limiter added this step: {stats['waited']:.1f} s")
+        print(f"projection: {steps} steps x {step:.1f} s / {workers} workers = {steps * step / workers:.0f} s of work; "
+              f"rate-limit floor {steps} x {n} = {steps * n} requests at {rbuild.REQUESTS_PER_MINUTE} a minute = {floor:.0f} s "
+              f"(the limiter is shared by all workers); budget {rbuild.WIND_BUDGET_S} s, so the projection is "
+              f"{max(steps * step / workers, floor):.0f} s")
+        return
     print(f"projection: 49 steps / 8 workers x {step:.1f} s = {49 * step / 8:.0f} s of wind (budget 600 s); "
           f"download-bound lower bound at the same MB per step is the same figure only if bandwidth scales with workers")
 
 
-def cloud_base_pressure(run, fh, get):
-    """PRES:cloud base (surface file) in hPa, NaN where HRRR reports none."""
-    url = hgrib.file_url(run, fh)
+def cloud_base_pressure(run, fh, get, mod=hgrib):
+    """PRES:cloud base (surface / 2dfld file) in hPa, NaN where the model reports none."""
+    url = mod.file_url(run, fh)
     rows = hgrib._rows(get(url + ".idx").decode())
     want = "anl" if fh == 0 else f"{fh} hour fcst"
     k = next(i for i, r in enumerate(rows) if len(r) > 5 and r[3] == "PRES" and r[4] == "cloud base" and r[5] == want)
@@ -129,18 +159,18 @@ def cloud_base_pressure(run, fh, get):
     return np.where(np.isclose(vals, miss) | ~np.isfinite(vals) | (vals <= 0) | (vals > 2e5), np.nan, vals) / 100.0
 
 
-def hrrr_threshold(argv):
+def hrrr_threshold(argv, mod=hgrib, label="HRRR", get_factory=None):
     run = datetime.strptime(argv[2], "%Y%m%d%H").replace(tzinfo=timezone.utc)
     fh = int(argv[3])
-    get = curl_get({"bytes": 0})
-    f = hgrib.read_layer_fields(run, fh, get, keep_condensate=True)
-    base = cloud_base_pressure(run, fh, get)
+    get = (get_factory or curl_get)({"bytes": 0, "requests": 0})
+    f = mod.read_layer_fields(run, fh, get, keep_condensate=True)
+    base = cloud_base_pressure(run, fh, get, mod)
     levels = np.array(f["levels"], float)               # 1000, 950 .. 150
     ps = f["ps"]
     has_base = np.isfinite(base)
     # level index of the base: nearest of the 18 levels on the 50 mb list
     bidx = np.clip(np.rint((1000.0 - base) / 50.0), 0, len(levels) - 1)
-    print(f"HRRR {run:%Y-%m-%d %HZ} f{fh:03d}: {ps.size} cells, {int(has_base.sum())} with a PRES:cloud base "
+    print(f"{label} {run:%Y-%m-%d %HZ} f{fh:03d}: {ps.size} cells, {int(has_base.sum())} with a PRES:cloud base "
           f"({100.0 * has_base.mean():.1f} %)")
     nb = int(has_base.sum())
     print("share within one level / exact level, two denominators: BOTH = cells with a base and a cloudy level "
@@ -161,9 +191,8 @@ def hrrr_threshold(argv):
         print(f"                   counts: both within1 {n1}, exact {n0}")
         shares[thr] = n1 / nb
     top = max(shares, key=shares.get)
-    pick = 1e-5 if shares[1e-5] >= shares[top] - 0.02 else top      # a tie within 2 points keeps 1e-5
-    print(f"best ALL share {100 * shares[top]:.1f} % at {top:.0e}; chosen {pick:.0e} "
-          f"({100 * shares[pick]:.1f} %; a tie within 2 points keeps 1e-5)")
+    print(f"best ALL share {100 * shares[top]:.1f} % at {top:.0e} (informational: CONDENSATE_CLOUDY is "
+          f"{layerwind.CONDENSATE_CLOUDY:.0e}, settled by the HRRR control)")
     print(f"peak RSS {peak_rss_mb():.0f} MB")
 
 
@@ -172,6 +201,10 @@ def main(argv):
         return hrrr_node(argv)
     if len(argv) == 4 and argv[1] == "hrrr-threshold":
         return hrrr_threshold(argv)
+    if len(argv) == 6 and argv[1] == "rrfs":
+        return hrrr_node(argv, rgrib, "RRFS", rrfs_get, steps=len(rbuild.wind_hours(rbuild.STEPS)), workers=rbuild.workers())
+    if len(argv) == 4 and argv[1] == "rrfs-threshold":
+        return hrrr_threshold(argv, rgrib, "RRFS", rrfs_get)
     if len(argv) != 6 or argv[1] != "gfs":
         sys.exit(__doc__)
     run = datetime.strptime(argv[2], "%Y%m%d%H").replace(tzinfo=timezone.utc)

@@ -21,7 +21,7 @@ from pipeline import wind
 from pipeline.encode import encode_square
 from pipeline.site import build_manifest, tiles_path, wind_path
 
-from .grib import FIELDS, file_url, read_fields, read_wind
+from .grib import FIELDS, file_url, read_fields, read_layer_wind
 from .grid import SQUARES, bin_index, coverage, cut_squares, node_average
 from pipeline.squares import square_name
 
@@ -37,6 +37,10 @@ WIND_BUDGET_S = 600        # build_wind gives up after this long: the cover must
 # group corners fall on -10, 10 .. 70 N and -180, -160 .. -60 E, 35 groups);
 # the 13 km grid reaches over the pole and across to Asia, which the app never asks of this feed.
 WIND_GROUPS = [wind.group_name(la, lo) for la in range(-10, 80, wind.GROUP_DEG) for lo in range(-180, -50, wind.GROUP_DEG)]
+# Wind is read every WIND_STEP_H hours (f000, f003 .. f084: 29 steps), not hourly like the cover: a wind step
+# costs 23 NOMADS requests on the live idx (21 where every level is one range) and the limit is shared, so
+# hourly wind (85 x 23 = 1,955 requests) could never fit WIND_BUDGET_S. Erik chose this 2026-11-18; the ICW1 file lists only the hours it holds and the app bridges the gaps.
+WIND_STEP_H = 3
 REQUESTS_PER_MINUTE = 90      # NOMADS's own limit could not be read; stay well under 100
 
 
@@ -68,6 +72,11 @@ def limited(get, limiter):
     return wrapped
 
 
+def wind_hours(fhs):
+    """The forecast hours of fhs that get wind: every WIND_STEP_H-th, f000 included."""
+    return [fh for fh in fhs if fh % WIND_STEP_H == 0]
+
+
 def workers():
     return int(os.environ.get("RRFS_WORKERS", "2"))
 
@@ -96,7 +105,7 @@ def _read_step(run, fh, get, sleep):
 def _read_wind_step(run, fh, get, sleep):
     for attempt in range(RETRIES + 1):
         try:
-            return read_wind(run, fh, get)
+            return read_layer_wind(run, fh, get)
         except Exception:
             if attempt == RETRIES:
                 raise
@@ -111,8 +120,10 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
     """wind/<run>/<group>.icw over the hours fhs; returns the manifest's `wind`
     entry, or None (any failure, or more than budget_s seconds: the files are
     removed and the cover goes out without wind). get is the limiter-wrapped
-    get the cover uses: four requests an hour (the idx, then each level's U and
-    V as one range). Groups outside WIND_GROUPS are not written."""
+    get the cover uses: per wind hour the two idx files, then one request per level
+    (its U, V, ABSV, CLMR and ICMR rows as one range; the live 500 and 250 mb levels carry an
+    extra STRM row in between, so those two are two ranges) and one for PRES:surface:
+    23 requests an hour on the live idx, every one counted by the limiter. Groups outside WIND_GROUPS are not written."""
     t0 = clock()
     deadline = t0 + budget_s
 
@@ -150,7 +161,7 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
         shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
         return None
     print(f"wind: {groups} groups, {len(fhs)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
-    return wind.manifest_entry(run)
+    return wind.manifest_entry(run, layer="cloud")
 
 
 def build(run, out_dir, get, now, sleep=time.sleep, fhs=None, clock=time.monotonic):
@@ -194,7 +205,8 @@ def build(run, out_dir, get, now, sleep=time.sleep, fhs=None, clock=time.monoton
         print("::warning::wind: no time left, skipped")
         wind_entry = None
     else:
-        wind_entry = build_wind(run, out_dir, get, sleep, fhs, workers(), budget_s=wind_budget)
+        wind_entry = build_wind(run, out_dir, get, sleep, wind_hours(fhs), workers(), budget_s=wind_budget) \
+            if wind_hours(fhs) else None
     m = json.loads(build_manifest(run, now, hours, names, 0, complete=fhs == full))
     m["model"] = "rrfs"
     m["attribution"] = ATTRIBUTION

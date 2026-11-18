@@ -8,7 +8,7 @@ import rrfs.build as rb
 from pipeline.encode import decode_square
 from pipeline.site import tiles_path
 from pipeline.squares import SIDE, square_name
-from rrfs.grib import FIELDS, file_url
+from rrfs.grib import FIELDS, file_url, prs_url
 from rrfs.grid import SQUARES
 from tests.gribfake import Files, msg
 
@@ -130,12 +130,17 @@ def test_cli_nothing_to_do(tmp_path, monkeypatch):
 
 def test_cli_builds_a_sample_and_rate_limits_every_request(tmp_path, monkeypatch):
     import rrfs_build
-    from tests.test_rrfs_wind import _wind_files
-    f = _files([0, 3])
-    for fh in (0, 3):                  # the prslev wind file of each hour, served beside the cover
-        w = _wind_files(fh, run=RUN)
-        f.blobs.update(w.blobs)
-        f.idx.update(w.idx)
+    from tests.test_rrfs_wind import _layer_files, _rmsg
+    f = Files()
+    for fh in (0, 3):
+        text = "anl" if fh == 0 else f"{fh} hour fcst"
+        w = _layer_files(fh, run=RUN)          # the prslev file; its 2dfld is replaced by cover + wind rows
+        f.blobs[prs_url(RUN, fh)] = w.blobs[prs_url(RUN, fh)]
+        f.idx[prs_url(RUN, fh) + ".idx"] = w.idx[prs_url(RUN, fh) + ".idx"]
+        rows = [("PRES", "surface", text, _rmsg("pres", 0, [101300.0] * 4))]
+        for k, (nme, lv) in enumerate(FIELDS):
+            rows.append((nme, lv, text, msg([5 * j * (k + 1) + fh for j in (1, 2, 3, 4)])))
+        f.add(file_url(RUN, fh), rows)
     n = {"acquired": 0}
 
     class Counting:
@@ -150,8 +155,9 @@ def test_cli_builds_a_sample_and_rate_limits_every_request(tmp_path, monkeypatch
     m = json.loads((tmp_path / "manifest.json").read_text())
     assert len(m["stepsMs"]) == 2 and m["complete"] is False
     assert "wind" in m and (tmp_path / "wind" / "2026110912").is_dir()
-    # cover: one idx and four ranges an hour; wind: one idx and three ranges (each level's U+V is one range); all counted
-    assert n["acquired"] == len(f.calls) == 2 * (5 + 4)
+    # cover: one idx and four ranges an hour; wind (hours 0 and 3 are both wind hours): two idx, one range a level
+    # (18) and PRES surface = 21; all counted
+    assert n["acquired"] == len(f.calls) == 2 * (5 + 21)
 
 
 def test_cli_failed_build_exits_1(tmp_path, monkeypatch):
