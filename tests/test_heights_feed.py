@@ -665,25 +665,26 @@ def test_a_height_that_is_not_falling_with_level_fails_the_heights(tmp_path, cap
     assert "heights" not in _manifest(tmp_path)
 
 
-# ---- The switch: heights are off unless TEXDEV_HEIGHTS=1 -----------------------------
+# ---- The switch: heights are tried unless TEXDEV_HEIGHTS=0 -----------------------------
 
-def test_heights_are_off_unless_the_variable_says_1():
+def test_heights_are_tried_unless_the_variable_says_0():
     assert texdev_build.HEIGHTS_ENV == "TEXDEV_HEIGHTS"
-    assert texdev_build.heights_wanted({}) is False
+    assert texdev_build.heights_wanted({}) is True
     assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "0"}) is False
-    assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "true"}) is False
+    assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "true"}) is True
     assert texdev_build.heights_wanted({"TEXDEV_HEIGHTS": "1"}) is True
 
 
 def test_a_run_with_heights_off_never_starts_them_and_publishes_whole(tmp_path, monkeypatch, capsys):
-    assert _budget_given(tmp_path, monkeypatch, {}, time.time, heights=None) is None
+    assert _budget_given(tmp_path, monkeypatch, {"TEXDEV_HEIGHTS": "0"}, time.time, heights=None) is None
     out = capsys.readouterr().out
     assert "heights off" in out and "heights may take" not in out
     man = _manifest(tmp_path)
     assert "heights" not in man and man["upper"] and man["clues"]
 
 
-def test_the_variable_set_to_1_tries_the_heights(tmp_path, monkeypatch, capsys):
-    got = _budget_given(tmp_path, monkeypatch, {"TEXDEV_HEIGHTS": "1"}, time.time, heights=None)
+def test_without_the_variable_the_heights_are_tried(tmp_path, monkeypatch, capsys):
+    # The scheduled runs: main's workflow never sets it.
+    got = _budget_given(tmp_path, monkeypatch, {}, time.time, heights=None)
     assert got is not None and got > 0
     assert "heights may take" in capsys.readouterr().out

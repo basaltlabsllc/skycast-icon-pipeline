@@ -77,17 +77,18 @@ PREBUILD_ALLOWANCE_S = 20 * 60
 # dir: {"entry": {...}} when the files are written, {"entry": null} when it
 # gave up cleanly (it printed why). Written whole, then renamed into place.
 HEIGHTS_RESULT = "heights-result.json"
-# The cloud heights are OFF unless this variable is "1" (Erik, 2026-11-18:
-# off in the scheduled builds while their slowness is found). On the runner
-# they did not finish inside their budget (run 44221721803), so every run
-# that tried spent that budget and published without them anyway. The
-# scheduled runs (main's copy of texdev.yml) never set it; this branch's
-# hand dispatch sets it from its "heights" input.
+# The cloud heights are tried unless this variable is "0". Erik switched them
+# off on 2026-11-18 after a run where they did not finish in their budget
+# (44221721803) and back on the same day: alone they took 13.8 min and inside
+# a whole build 8.2 min (runs 44369773457, 44369779643), and the failed run's
+# downloads from DWD were about half speed. The scheduled runs (main's copy of
+# texdev.yml) never set it; this branch's hand dispatch sets it from its
+# "heights" input, to build without them.
 HEIGHTS_ENV = "TEXDEV_HEIGHTS"
 
 
 def heights_wanted(env):
-    return env.get(HEIGHTS_ENV, "") == "1"
+    return env.get(HEIGHTS_ENV, "") != "0"
 
 
 def job_start(env, fallback):
@@ -263,7 +264,7 @@ def build(out, state, work, deps, steps=None, workers=None, squares=None, env=No
     built = deps.now()
     (root / "manifest.json").write_text(manifest(run, built, names, upper, clues))
     if not heights:
-        print(f"texdev: heights off ({HEIGHTS_ENV} is not 1)")
+        print(f"texdev: heights off ({HEIGHTS_ENV} is 0)")
         return run_build.BUILT
     try:
         now = clock()

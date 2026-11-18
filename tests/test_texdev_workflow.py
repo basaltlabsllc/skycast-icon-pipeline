@@ -179,11 +179,11 @@ def test_the_header_says_who_fires_the_scheduled_runs():
     assert [line.strip() for line in on if len(line) - len(line.lstrip()) == 2] == ["workflow_dispatch:"]
 
 
-def test_the_hand_dispatch_tries_the_heights_only_when_asked():
-    # Off by default: the scheduled runs (main's copy) never set the variable,
-    # and a hand dispatch sets it to 1 only with its "heights" box ticked.
+def test_the_hand_dispatch_tries_the_heights_unless_unticked():
+    # On by default: the scheduled runs (main's copy) never set the variable,
+    # and a hand dispatch sets it to 0 only with its "heights" box unticked.
     import texdev_build
     on = "\n".join(top_block(CODE, "on"))
-    assert re.search(r"heights:\n(?:.*\n)*?\s+type: boolean\n\s+default: false", on)
+    assert re.search(r"heights:\n(?:.*\n)*?\s+type: boolean\n\s+default: true", on)
     build_env = CODE.split("id: build")[1].split("run: |")[0]
     assert f"{texdev_build.HEIGHTS_ENV}: ${{{{ inputs.heights && '1' || '0' }}}}" in build_env
