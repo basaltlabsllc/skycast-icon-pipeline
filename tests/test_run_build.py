@@ -457,7 +457,7 @@ def test_unlisted_thickness_waits_then_publishes_without(tmp_path, capsys):
     site, blob = _thick_build(tmp_path, deps, [0, 1])
     # The fake listing carries no column files either, so the columns wait
     # their own 15 minutes after the thickness's.
-    assert sum(calls["sleeps"]) == run_build.THICK_WAIT_S + run_build.COLUMN_WAIT_S
+    assert sum(calls["sleeps"]) == run_build.THICK_WAIT_S + run_build.WIND_WAIT_S + run_build.COLUMN_WAIT_S
     assert calls["regrids_values"] == []
     assert json.loads((blob / "manifest.json").read_text())["thick"] is None
     assert not (blob / "thick").exists()
@@ -668,7 +668,8 @@ def test_column_files_not_yet_listed_wait_then_publish_without_columns(tmp_path,
     assert _columns_build(tmp_path, deps, steps) == run_build.BUILT
     m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
     assert m["columns"] is None
-    assert sum(calls["sleeps"]) == run_build.COLUMN_WAIT_S
+    # (the fake listing carries no wind files either: that wait comes first)
+    assert sum(calls["sleeps"]) == run_build.WIND_WAIT_S + run_build.COLUMN_WAIT_S
     assert (tmp_path / "site" / m["tiles"] / "N40W125.icl").exists()
     assert not (tmp_path / "blob" / "columns").exists()
     assert "::warning::columns" in capsys.readouterr().out
