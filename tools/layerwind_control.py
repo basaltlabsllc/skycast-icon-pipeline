@@ -9,16 +9,23 @@ download MB and seconds.
     python tools/layerwind_control.py hrrr-threshold <YYYYMMDDHH> <fh>
     python tools/layerwind_control.py rrfs <YYYYMMDDHH> <fh> <lat> <lon>
     python tools/layerwind_control.py rrfs-threshold <YYYYMMDDHH> <fh>
+    python tools/layerwind_control.py aifs <YYYYMMDDHH> <fh> <lat> <lon> [<lat> <lon> ...]
+    python tools/layerwind_control.py ifs  <YYYYMMDDHH> <fh> <lat> <lon> [<lat> <lon> ...]
 
 gfs / hrrr / rrfs print the one node asked for plus, for HRRR and RRFS, a count-only positive
 control (how many cells have a cloudy level, no coordinates). hrrr-threshold
 (and rrfs-threshold) compares, per point, the model's lowest cloudy level with its own
 PRES:cloud base at CONDENSATE_CLOUDY candidates and prints counts and shares only.
 rrfs goes through the build's own NOMADS rate limiter (90 requests a minute).
+aifs / ifs read one step through the build's own reader from the S3 mirror of ECMWF
+open data, print each node with a hand computation of every deck (written here, not
+pipeline.layerwind) beside the reader's wind, a count-only positive control, the
+message params read from the bytes, and requests, MB, seconds, peak RSS and the
+projection over the model's wind steps.
 
 Downloads with curl (byte ranges, the same ranges the build asks for); needs
 noaa-gfs-bdp-pds.s3.amazonaws.com (gfs), noaa-hrrr-bdp-pds.s3.amazonaws.com (hrrr)
-or nomads.ncep.noaa.gov (rrfs)."""
+nomads.ncep.noaa.gov (rrfs) or ecmwf-forecasts.s3.eu-central-1.amazonaws.com (aifs, ifs)."""
 import resource
 import subprocess
 import sys
@@ -34,7 +41,7 @@ import hrrr.grib as hgrib  # noqa: E402
 import rrfs.build as rbuild  # noqa: E402
 import rrfs.grib as rgrib  # noqa: E402
 from globalfeed import grib  # noqa: E402
-from globalfeed.models import GFS  # noqa: E402
+from globalfeed.models import AIFS, GFS, IFS  # noqa: E402
 from pipeline import layerwind  # noqa: E402
 
 
@@ -196,7 +203,157 @@ def hrrr_threshold(argv, mod=hgrib, label="HRRR", get_factory=None):
     print(f"peak RSS {peak_rss_mb():.0f} MB")
 
 
+EC_MIRROR = ("https://data.ecmwf.int/forecasts/", "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com/")
+
+
+def _hand_rh(hum, val, t, p_hpa):
+    """Effective RH (%), written out again here from the spec (not pipeline.layerwind):
+    q -> e = q p / (0.622 + 0.378 q); RH over water = e / esw; below 0 C x esw / esi."""
+    esw = 611.2 * np.exp(17.62 * (t - 273.15) / (t - 30.03))
+    esi = np.exp(9.550426 - 5723.265 / t + 3.53068 * np.log(t) - 0.00728332 * t)
+    rh = 100.0 * (val * p_hpa * 100.0 / (0.622 + 0.378 * val)) / esw if hum == "q" else val
+    return rh * esw / esi if t < 273.15 else rh
+
+
+def _hand_deck(levels, u, v, moist, lo, hi, ps, low_deck):
+    """One node's deck by hand: members, weights, thickest moist run, weighted mean."""
+    mem = [k for k, p in enumerate(levels) if lo <= p <= ps and (p < hi or (low_deck and p <= hi))]
+    if not mem:
+        return [], [], None, (float("nan"), float("nan"))
+    w = {}
+    for j, k in enumerate(mem):                     # levels descend: mem[j - 1] is the level below
+        below = 0.5 * (levels[mem[j - 1]] + levels[k]) if j > 0 else min(hi, ps)
+        above = 0.5 * (levels[k] + levels[mem[j + 1]]) if j + 1 < len(mem) else lo
+        w[k] = below - above
+    runs, cur = [], []
+    for k in mem:
+        if moist[k]:
+            cur.append(k)
+        elif cur:
+            runs.append(cur); cur = []
+    if cur:
+        runs.append(cur)
+    best = None
+    for r in runs:                                  # ground up, so a tie keeps the lower run
+        if best is None or sum(w[k] for k in r) > sum(w[k] for k in best):
+            best = r
+    use = best or mem
+    sw = sum(w[k] for k in use)
+    return mem, w, best, (sum(w[k] * u[k] for k in use) / sw, sum(w[k] * v[k] for k in use) / sw)
+
+
+def ecmwf_node(argv):
+    import dataclasses
+    model = {"aifs": AIFS, "ifs": IFS}[argv[1]]
+    model = dataclasses.replace(model, _url=model._url.replace(*EC_MIRROR))
+    run = datetime.strptime(argv[2], "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    fh = int(argv[3])
+    nodes = [(float(argv[k]), float(argv[k + 1])) for k in range(4, len(argv) - 1, 2)]
+    stats = {"bytes": 0, "requests": 0}
+    inner = curl_get(stats)
+    raw_msgs = []
+
+    stats["retries"], stats["waited"] = 0, 0.0
+
+    def get(url, rng=None):
+        # the S3 mirror answers 503 SlowDown under bursts: back off and retry, and keep the
+        # seconds spent waiting out of the step time (the build reads data.ecmwf.int)
+        stats["requests"] += 1
+        for attempt in range(8):
+            try:
+                b = inner(url, rng)
+                break
+            except subprocess.CalledProcessError:
+                if attempt == 7:
+                    raise
+                stats["retries"] += 1
+                t = time.monotonic()
+                time.sleep(2.0 * (attempt + 1))
+                stats["waited"] += time.monotonic() - t
+        if rng is not None:
+            raw_msgs.extend(grib.split_messages(b))
+        return b
+
+    t0 = time.monotonic()
+    raw = grib.read_wind_fields(model, run, fh, get)
+    t1 = time.monotonic()
+    result = grib.ecmwf_deck_winds(model, raw)
+    t2 = time.monotonic()
+    levels, hum = grib.ECMWF_WIND[model.name]
+    seen = {}
+    for m in raw_msgs:
+        g = eccodes.codes_new_from_message(m)
+        try:
+            k = tuple(str(eccodes.codes_get(g, x)) for x in ("shortName", "typeOfLevel", "units"))
+            seen.setdefault(k, []).append(int(eccodes.codes_get(g, "level")))
+        finally:
+            eccodes.codes_release(g)
+    print(f"{model.name.upper()} {run:%Y-%m-%d %HZ} f{fh:03d}: {len(raw_msgs)} messages read; params from the bytes:")
+    for (short, tol, units), levs in sorted(seen.items()):
+        print(f"  {short:3s} {tol:14s} {units:10s} levels {sorted(levs, reverse=True)}")
+    lat, lon = result["lat"], result["lon"]
+    ps_all = raw[("sfc", "sp")] / 100.0
+    for lat0, lon0 in nodes:
+        i = int(np.argmin(np.abs(lat - lat0)))
+        j = int(np.argmin(np.abs(lon - lon0)))
+        ps = float(ps_all[i, j])
+        u = [float(raw[(l, "u")][i, j]) for l in levels]
+        v = [float(raw[(l, "v")][i, j]) for l in levels]
+        rh = [float(_hand_rh(hum, float(raw[(l, hum)][i, j]), float(raw[(l, "t")][i, j]), l)) for l in levels]
+        moist = [x >= 90.0 for x in rh]
+        print(f"node {lat[i]:.2f},{lon[j]:.2f}: surface pressure {ps:.1f} hPa")
+        for k, l in enumerate(levels):
+            print(f"  {l:5d} hPa  u {u[k]:7.2f}  v {v[k]:7.2f}  {hum} {float(raw[(l, hum)][i, j]):.3g}  "
+                  f"t {float(raw[(l, 't')][i, j]):6.1f}  RH_eff {rh[k]:5.1f} {'moist' if moist[k] else 'dry  '}"
+                  f"{'  underground' if l > ps else ''}")
+        for d, (key, name) in enumerate(zip(layerwind.DECK_KEYS, ("low", "mid", "high"))):
+            a, b = max(0.8 * ps, 150.0), max(0.45 * ps, 150.0)
+            lo, hi = ((a, ps), (b, a), (150.0, b))[d]
+            mem, w, best, (hu, hv) = _hand_deck(levels, u, v, moist, lo, hi, ps, d == 0)
+            ru, rv = float(result[(key, "u")][i, j]), float(result[(key, "v")][i, j])
+            ok = (np.isnan(hu) and np.isnan(ru)) or (abs(hu - ru) < 1e-3 and abs(hv - rv) < 1e-3)
+            print(f"  {name:4s} deck {hi:.0f}..{lo:.0f}: levels {[levels[k] for k in mem] or 'none'} "
+                  f"weights {[round(w[k], 1) for k in mem]}; run {[levels[k] for k in best] if best else 'none (mean of every level)'}; "
+                  f"hand u {hu:.3f} v {hv:.3f}; reader u {ru:.3f} v {rv:.3f}; {'MATCH' if ok else 'MISMATCH'}")
+    # Positive control, no coordinates printed
+    shape = ps_all.shape
+    psf = ps_all.reshape(-1).astype(np.float64)
+    bounds = layerwind.deck_bounds("ecmwf", psf)
+    uu = [raw[(l, "u")].reshape(-1) for l in levels]
+    vv = [raw[(l, "v")].reshape(-1) for l in levels]
+    mm = [layerwind.moist_from_q(raw[(l, "q")].reshape(-1), raw[(l, "t")].reshape(-1), l) for l in levels]
+    plain = layerwind.deck_winds(levels, uu, vv, [np.zeros(psf.shape, bool)] * len(levels), psf, bounds)
+    for k, l in enumerate(levels):
+        above = l <= psf
+        print(f"moist share {l:5d} hPa: {100.0 * mm[k][above].mean():5.1f} % of above-ground cells")
+    for d, (key, name) in enumerate(zip(layerwind.DECK_KEYS, ("low", "mid", "high"))):
+        lo, hi = bounds[d]
+        any_m = np.zeros(psf.shape, bool)
+        for k, l in enumerate(levels):
+            any_m |= (l >= lo) & (l <= psf) & ((l < hi) | (d == 0) & (l <= hi)) & mm[k]
+        diff = np.hypot(result[(key, "u")].reshape(-1) - plain[(key, "u")],
+                        result[(key, "v")].reshape(-1) - plain[(key, "v")])
+        moved = diff > 0.5
+        nan = int(np.isnan(result[(key, "u")]).sum())
+        print(f"control {name:4s}: {int(any_m.sum())} of {psf.size} cells hold a moist level; humidity-layer wind "
+              f"differs from the whole-deck mean by > 0.5 m/s at {int((moved & any_m).sum())} of them, at "
+              f"{int((moved & ~any_m).sum())} clear cells (must be 0), max clear-cell diff "
+              f"{float(np.nanmax(np.where(any_m, 0.0, diff))):.2g}; NaN cells {nan}")
+    t3 = time.monotonic()
+    mb = stats["bytes"] / 1e6
+    step = t2 - t0 - stats["waited"]
+    steps = len(model.main_steps) + len(model.tail_steps)
+    print(f"mirror retries {stats['retries']}, {stats['waited']:.1f} s of backoff (left out of the step time below)")
+    print(f"requests {stats['requests']} (1 index + {stats['requests'] - 1} ranged), download {mb:.1f} MB; "
+          f"download+decode {t1 - t0:.1f} s, layer rule {t2 - t1:.1f} s, step total {step:.1f} s "
+          f"(control extras {t3 - t2:.1f} s, not counted); peak RSS {peak_rss_mb():.0f} MB")
+    print(f"projection: {steps} steps x {step:.1f} s / {model.workers} workers = {steps * step / model.workers:.0f} s "
+          f"of wind against WIND_BUDGET_S 600 (if the mirror's bandwidth scales with workers)")
+
+
 def main(argv):
+    if len(argv) >= 6 and len(argv) % 2 == 0 and argv[1] in ("aifs", "ifs"):
+        return ecmwf_node(argv)
     if len(argv) == 6 and argv[1] == "hrrr":
         return hrrr_node(argv)
     if len(argv) == 4 and argv[1] == "hrrr-threshold":

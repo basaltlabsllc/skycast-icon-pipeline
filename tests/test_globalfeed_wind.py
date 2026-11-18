@@ -72,21 +72,48 @@ def _row(param, levtype, lev, off, ln):
     return json.dumps(d)
 
 
-def test_ecmwf_wind_ranges():
-    rows = [_row("u", "sfc", None, 5, 5)]       # a 10 m-style row that must not be picked
-    off = 1000
-    for lev in (850, 500, 250):
-        for p in "uv":
-            rows.append(_row(p, "pl", lev, off, 50))
-            off += 50
-    r = grib.wind_ranges(AIFS, "\n".join(rows), 6)
-    assert r[(850, "u")] == (1000, 1049) and r[(850, "v")] == (1050, 1099)
-    assert r[(250, "v")] == (1250, 1299)
-    assert len(r) == 6
-    with pytest.raises(KeyError):
-        grib.wind_ranges(IFS, "\n".join(rows[:-1]), 6)
-    with pytest.raises(KeyError):
-        grib.wind_ranges(IFS, "\n".join([_row("u", "sfc", None, 5, 5)]), 6)
+EC_LEVELS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150)
+
+
+def _ec_index_rows(model, skip=()):
+    """ECMWF .index rows (param, levtype, level) for the wind of `model`, plus decoys."""
+    hums = ("q",) if model.name == "aifs" else ("r", "q")     # IFS lists both; AIFS has no r
+    rows = [("u", "sfc", None)]                        # a 10 m-style row that must not be picked
+    for lev in EC_LEVELS + (100, 50):                  # 100 and 50 hPa: above every deck, never asked for
+        for p in ("v", "u") + hums + ("t", "w"):
+            rows.append((p, "pl", lev))
+    rows.append(("sp", "sfc", None))
+    return [r for r in rows if r not in skip]
+
+
+def _ec_index(model, skip=()):
+    return "\n".join(_row(p, lt, lev, i * 100, 100) for i, (p, lt, lev) in enumerate(_ec_index_rows(model, skip)))
+
+
+def test_ecmwf_wind_ranges_cover_every_deck_level():
+    for model, hum in ((AIFS, "q"), (IFS, "q")):
+        rows = _ec_index_rows(model)
+        r = grib.wind_ranges(model, _ec_index(model), 6)
+        assert len(r) == 4 * len(EC_LEVELS) + 1
+        for lev in EC_LEVELS:
+            for comp in ("u", "v", hum, "t"):
+                k = rows.index((comp, "pl", lev))
+                assert r[(lev, comp)] == (k * 100, k * 100 + 99), (model.name, lev, comp)
+        k = rows.index(("sp", "sfc", None))
+        assert r[("sfc", "sp")] == (k * 100, k * 100 + 99)
+        assert (100, "u") not in r and (850, "w") not in r and (850, "r") not in r
+    assert grib.AIFS_WIND_LEVELS == EC_LEVELS and grib.IFS_WIND_LEVELS == EC_LEVELS
+
+
+def test_ecmwf_missing_humidity_or_sp_row_raises_keyerror():
+    for model, skip in ((AIFS, ("q", "pl", 700)), (AIFS, ("t", "pl", 250)), (AIFS, ("u", "pl", 150)),
+                        (AIFS, ("sp", "sfc", None)), (IFS, ("q", "pl", 925)), (IFS, ("v", "pl", 1000))):
+        with pytest.raises(KeyError):
+            grib.wind_ranges(model, _ec_index(model, skip=(skip,)), 6)
+    # IFS's r is no stand-in for q (its r is over ice below 0 C): an IFS index whose
+    # 925 hPa q row is missing fails even though r is there
+    with pytest.raises(KeyError, match="q "):
+        grib.wind_ranges(IFS, _ec_index(IFS, skip=(("q", "pl", 925),)), 6)
 
 
 def _small(model, main, tail=()):
@@ -207,35 +234,73 @@ def test_wind_skipped_when_no_time_left(monkeypatch, tmp_path, capsys):
 
 def test_wind_flags():
     assert GFS.wind and AIFS.wind and IFS.wind
-    assert GFS.wind_layer == "cloud" and AIFS.wind_layer is None and IFS.wind_layer is None
+    assert GFS.wind_layer == "cloud" and AIFS.wind_layer == "humidity" and IFS.wind_layer == "humidity"
 
 
-def _wind_msg(comp, lev, val):
+_EC_PARAM = {"u": (2, 2), "v": (2, 3), "t": (0, 0), "q": (1, 0), "r": (1, 1)}
+
+
+def _ec_msg(kind, lev, vals):
+    """A 2 x 2 ECMWF-style GRIB2 message: u / v / t / q / r on `lev` hPa, or sp at the surface (Pa)."""
     import eccodes
-    h = eccodes.codes_grib_new_from_samples("regular_ll_pl_grib2")
+    if kind == "sp":
+        h = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+        spec = (("parameterCategory", 3), ("parameterNumber", 0), ("typeOfFirstFixedSurface", 1),
+                ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", 0))
+    else:
+        h = eccodes.codes_grib_new_from_samples("regular_ll_pl_grib2")
+        cat, num = _EC_PARAM[kind]
+        spec = (("parameterCategory", cat), ("parameterNumber", num), ("typeOfFirstFixedSurface", 100),
+                ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", lev * 100))
     for k, v in (("Ni", 2), ("Nj", 2), ("latitudeOfFirstGridPointInDegrees", 41.0),
-                 ("latitudeOfLastGridPointInDegrees", 40.0),
-                 ("longitudeOfFirstGridPointInDegrees", 250.0),
-                 ("longitudeOfLastGridPointInDegrees", 251.0),
-                 ("iDirectionIncrementInDegrees", 1.0), ("jDirectionIncrementInDegrees", 1.0),
-                 ("bitsPerValue", 24), ("discipline", 0), ("parameterCategory", 2),
-                 ("parameterNumber", 2 if comp == "u" else 3), ("typeOfFirstFixedSurface", 100),
-                 ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", lev * 100)):
+                 ("latitudeOfLastGridPointInDegrees", 40.0), ("longitudeOfFirstGridPointInDegrees", 250.0),
+                 ("longitudeOfLastGridPointInDegrees", 251.0), ("iDirectionIncrementInDegrees", 1.0),
+                 ("jDirectionIncrementInDegrees", 1.0), ("bitsPerValue", 24), ("discipline", 0)) + spec:
         eccodes.codes_set(h, k, v)
-    eccodes.codes_set_values(h, np.full(4, float(val)))
+    eccodes.codes_set_values(h, np.array(vals, dtype=float))
     b = eccodes.codes_get_message(h)
     eccodes.codes_release(h)
     return b
 
 
-def _ifs_order_fixture(swap=False):
-    """IFS lists v before u at each level; messages laid in that file order."""
-    order = [(lev, c) for lev in (850, 500, 250) for c in "vu"]
+def _esw(t):
+    return 611.2 * np.exp(17.62 * (t - 273.15) / (t - 30.03))
+
+
+def _q_at(rh, t, p_hpa):
+    """Specific humidity (kg/kg) for RH over water `rh` % at T (K), p (hPa)."""
+    e = rh / 100.0 * _esw(t)
+    return 0.622 * e / (p_hpa * 100.0 - 0.378 * e)
+
+
+# Columns for the four points (2 x 2): RH over water (%) and T (K) per level, the same at
+# every point; ps differs per point. 925 is the only moist level in the low deck at 1013
+# hPa, 600 the only one in the mid deck; 1000 is moist too but underground where ps = 900.
+# 300 hPa is cold (250 K): RH 80 % over water is about 100 % over ice, so moist.
+EC_RH = {1000: 95.0, 925: 95.0, 850: 20.0, 700: 30.0, 600: 96.0, 500: 40.0,
+         400: 20.0, 300: 80.0, 250: 10.0, 200: 10.0, 150: 10.0}
+EC_T = {lev: (250.0 if lev == 300 else 280.0) for lev in EC_LEVELS}
+EC_PS = [101300.0, 101300.0, 90000.0, 90000.0]
+
+
+def _ec_fixture(model, u_of=lambda lev: lev / 10.0, ps_pa=EC_PS, swap=None):
+    """The model's wind file (2 x 2 fields) laid in a scrambled order like the real one,
+    its .index, and a get() serving both. swap=(key, kind): that slot holds a `kind` message."""
+    hum = grib.ECMWF_WIND[model.name][1]
+    parts = []
+    for lev in EC_LEVELS:
+        for kind in ("v", "u", hum, "t"):
+            val = {"u": u_of(lev), "v": -1.0, "t": EC_T[lev], "r": EC_RH[lev],
+                   "q": _q_at(EC_RH[lev], EC_T[lev], lev)}[kind]
+            parts.append(((lev, kind), _ec_msg(kind, lev, [val] * 4)))
+    parts.append((("sfc", "sp"), _ec_msg("sp", 0, ps_pa)))
+    parts = parts[1::2] + parts[0::2]                  # the real file is not in level order
     rows, buf = [], b""
-    for i, (lev, c) in enumerate(order):
-        mc = ("u" if c == "v" else "v") if (swap and (lev, c) == (500, "u")) else c
-        m = _wind_msg(mc, lev, 10 * (i + 1))
-        rows.append(_row(c, "pl", lev, len(buf), len(m)))
+    for key, m in parts:
+        if swap and key == swap[0]:
+            m = _ec_msg(swap[1], 850 if key[0] == "sfc" else key[0], [1.0] * 4)
+        lev, kind = key
+        rows.append(_row(kind, "sfc" if lev == "sfc" else "pl", None if lev == "sfc" else lev, len(buf), len(m)))
         buf += m
     idx = "\n".join(rows)
 
@@ -243,20 +308,67 @@ def _ifs_order_fixture(swap=False):
         if url.endswith(".index"):
             return idx.encode()
         return buf[rng[0]:rng[1] + 1]
-    return get, order
+    return get
 
 
-def test_read_wind_step_ifs_order_maps_correctly():
-    get, order = _ifs_order_fixture()
-    out = grib.read_wind_step(IFS, RUN, 6, get)
-    for i, (lev, c) in enumerate(order):
-        assert out[(lev, c)][0, 0] == 10 * (i + 1)
+def test_ecmwf_read_wind_step_returns_humidity_layer_winds():
+    from pipeline import layerwind
+    for model in (AIFS, IFS):
+        out = grib.read_wind_step(model, RUN, 6, _ec_fixture(model))
+        assert sorted(k for k in out if k not in ("lat", "lon")) == sorted((l, c) for l in (850, 500, 250) for c in "uv")
+        assert out[(850, "u")].shape == (2, 2) and out[(850, "u")].dtype == np.float32
+        # the expected values from Task 1's core, run by hand on the same column
+        p = np.array(EC_LEVELS, float)
+        t = [np.array([EC_T[l]]) for l in EC_LEVELS]
+        moist = [layerwind.moist_from_q(np.array([_q_at(EC_RH[l], EC_T[l], l)]), t[k], l)
+                 for k, l in enumerate(EC_LEVELS)]
+        assert [l for k, l in enumerate(EC_LEVELS) if moist[k][0]] == [1000, 925, 600, 300], model.name
+        for pt, ps in ((0, 1013.0), (2, 900.0)):
+            want = layerwind.deck_winds(p, [np.array([l / 10.0]) for l in EC_LEVELS],
+                                        [np.array([-1.0])] * len(EC_LEVELS), moist, np.array([ps]),
+                                        layerwind.deck_bounds("ecmwf", np.array([ps])))
+            for key in (850, 500, 250):
+                for c in "uv":
+                    got, w = out[(key, c)].reshape(-1)[pt], want[(key, c)][0]
+                    assert got == pytest.approx(w, rel=1e-5), (model.name, pt, key, c)
+        # ps 1013: low deck 1013..810 holds 1000, 925, 850; the thickest moist run is 1000-925
+        # (weights 13 + 75 + ... ), mid 810..456 has 600 alone, high 456..150 has 300 alone
+        w1000, w925 = 1013.0 - 962.5, 962.5 - 887.5
+        assert out[(850, "u")][0, 0] == pytest.approx((100.0 * w1000 + 92.5 * w925) / (w1000 + w925), rel=1e-5)
+        assert out[(500, "u")][0, 0] == pytest.approx(60.0)
+        assert out[(250, "u")][0, 0] == pytest.approx(30.0)
+        # ps 900: 1000 and 925 are underground, so the moist 1000-925 run never counts; the
+        # low deck 900..720 holds 850 alone, which is dry: the deck mean is 850's wind
+        assert out[(850, "u")][1, 0] == pytest.approx(85.0)
+        assert out[(500, "u")][1, 0] == pytest.approx(60.0)
 
 
-def test_read_wind_step_rejects_swapped_message():
-    get, _ = _ifs_order_fixture(swap=True)
+def test_ecmwf_read_wind_step_rejects_swapped_message():
+    with pytest.raises(ValueError, match="expected q 700"):
+        grib.read_wind_step(AIFS, RUN, 6, _ec_fixture(AIFS, swap=((700, "q"), "t")))
+    with pytest.raises(ValueError, match="expected q 925"):
+        grib.read_wind_step(IFS, RUN, 6, _ec_fixture(IFS, swap=((925, "q"), "r")))
     with pytest.raises(ValueError, match="expected u 500"):
-        grib.read_wind_step(IFS, RUN, 6, get)
+        grib.read_wind_step(IFS, RUN, 6, _ec_fixture(IFS, swap=((500, "u"), "v")))
+    with pytest.raises(ValueError, match="surface pressure"):
+        grib.read_wind_step(AIFS, RUN, 6, _ec_fixture(AIFS, swap=(("sfc", "sp"), "t")))
+
+
+def test_ecmwf_pressure_level_message_must_be_isobaric():
+    import eccodes
+    get = _ec_fixture(AIFS)
+    good = _ec_msg("t", 850, [EC_T[850]] * 4)
+    h = eccodes.codes_new_from_message(good)
+    eccodes.codes_set(h, "typeOfFirstFixedSurface", 105)          # a model level numbered 850
+    eccodes.codes_set(h, "scaledValueOfFirstFixedSurface", 850)
+    bad = eccodes.codes_get_message(h); eccodes.codes_release(h)
+    assert len(bad) == len(good)
+
+    def g(url, rng=None):
+        b = get(url, rng)
+        return b if url.endswith(".index") else b.replace(good, bad)
+    with pytest.raises(ValueError, match="expected t 850"):
+        grib.read_wind_step(AIFS, RUN, 6, g)
 
 
 def _gfs_msg(kind, lev, vals):
@@ -344,20 +456,13 @@ def test_gfs_level_missing_its_ugrd_row_raises_keyerror():
 
 
 def test_ecmwf_wind_fields_stay_float64_and_unchanged():
-    get, order = _ifs_order_fixture()
-    out = grib.read_wind_step(IFS, RUN, 6, get)
-    for i, (lev, c) in enumerate(order):
-        a = out[(lev, c)]
-        assert a.dtype == np.float64 and a.shape == (2, 2)
-        assert (a == float(10 * (i + 1))).all()
-    # the same values the reader's own decode (eccodes + isclose-missing mask) gives, uncast
-    import eccodes
-    raw = _wind_msg("u", 850, 12.3456789)
-    g = eccodes.codes_new_from_message(raw)
-    want = np.where(np.isclose(eccodes.codes_get_values(g), eccodes.codes_get(g, "missingValue")), np.nan,
-                    eccodes.codes_get_values(g))
-    eccodes.codes_release(g)
-    assert want.dtype == np.float64
+    for model in (AIFS, IFS):
+        out = grib.read_wind_fields(model, RUN, 6, _ec_fixture(model))
+        for lev in EC_LEVELS:
+            a = out[(lev, "u")]
+            assert a.dtype == np.float64 and a.shape == (2, 2)
+            assert (a == lev / 10.0).all() and (out[(lev, "t")] == EC_T[lev]).all()
+        assert out[("sfc", "sp")].dtype == np.float64
 
 
 def _swap_get(get, idx_edit):
@@ -392,3 +497,104 @@ def test_gfs_pres_that_is_not_the_surface_is_rejected():
         return b if url.endswith(".idx") else b.replace(base_msg, bad)   # ranges merge touching messages
     with pytest.raises(ValueError, match="surface pressure"):
         grib.read_wind_step(GFS, RUN, 6, g)
+
+
+# ---- throttled requests on the wind path (pipeline/throttle.py) ----------------
+
+def _http_error(code, retry_after=None):
+    import email.message
+    import urllib.error
+    h = email.message.Message()
+    if retry_after is not None:
+        h["Retry-After"] = retry_after
+    return urllib.error.HTTPError("https://x/f.grib2", code, "err", h, None)
+
+
+def _scripted_get(outcomes):
+    """get() that raises / returns the scripted outcomes in order; records the calls."""
+    calls = []
+
+    def get(url, rng=None):
+        calls.append((url, rng))
+        o = outcomes.pop(0)
+        if isinstance(o, Exception):
+            raise o
+        return o
+    return get, calls
+
+
+def test_throttle_429_then_success_after_one_sleep():
+    from pipeline import throttle
+    sleeps = []
+    get, calls = _scripted_get([_http_error(429), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u", (0, 9)) == b"ok"
+    assert sleeps == [2.0] and calls == [("u", (0, 9))] * 2
+
+
+def test_throttle_honours_retry_after():
+    from pipeline import throttle
+    sleeps = []
+    get, _ = _scripted_get([_http_error(429, "7"), _http_error(503, "Wed, 18 Nov 2026 12:00:00 GMT"), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u") == b"ok"
+    assert sleeps == [7.0, 4.0]                    # a numeric Retry-After, then a date: the backoff
+    get, _ = _scripted_get([_http_error(429, "900"), b"ok"])
+    sleeps.clear()
+    throttle.retry_throttled(get, sleeps.append)("u")
+    assert sleeps == [throttle.CAP_S]              # capped
+
+
+def test_throttle_503_retries_and_404_does_not():
+    import urllib.error
+    from pipeline import throttle
+    sleeps = []
+    get, _ = _scripted_get([_http_error(503), _http_error(503), b"ok"])
+    assert throttle.retry_throttled(get, sleeps.append)("u") == b"ok" and sleeps == [2.0, 4.0]
+    for code in (404, 403, 500):
+        sleeps.clear()
+        get, calls = _scripted_get([_http_error(code), b"never"])
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            throttle.retry_throttled(get, sleeps.append)("u")
+        assert ei.value.code == code and len(calls) == 1 and sleeps == []
+    get, calls = _scripted_get([OSError("reset"), b"never"])
+    with pytest.raises(OSError):
+        throttle.retry_throttled(get, sleeps.append)("u")
+    assert len(calls) == 1
+
+
+def test_throttle_gives_up_after_the_cap_and_at_the_deadline():
+    import urllib.error
+    from pipeline import throttle
+    sleeps = []
+    get, calls = _scripted_get([_http_error(429)] * 10)
+    with pytest.raises(urllib.error.HTTPError):
+        throttle.retry_throttled(get, sleeps.append)("u")
+    assert len(calls) == throttle.ATTEMPTS and sleeps == [2.0, 4.0, 8.0, 16.0]
+    # with the budget clock: a wait that would end past the deadline is not made
+    now = [0.0]
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+    sleeps.clear()
+    get, calls = _scripted_get([_http_error(429)] * 10)
+    with pytest.raises(urllib.error.HTTPError):
+        throttle.retry_throttled(get, sleep, clock=lambda: now[0], deadline=5.0)("u")
+    assert sleeps == [2.0] and len(calls) == 2      # 2 + 4 > 5: the third try is never made
+
+
+def test_build_wind_survives_one_429_per_request(tmp_path):
+    base = _ec_fixture(AIFS)
+    seen, sleeps = set(), []
+
+    def get(url, rng=None):
+        k = (url, rng)
+        if k not in seen:                              # every request is throttled once
+            seen.add(k)
+            raise _http_error(429)
+        return base(url, rng)
+
+    m = _small(AIFS, (0, 6))
+    e = gb.build_wind(m, RUN, tmp_path, get, sleeps.append)
+    assert e is not None and e["layer"] == "humidity"
+    assert len(sleeps) == len(seen) and set(sleeps) == {2.0}
+    assert any((tmp_path / "wind/2026110800").glob("*.icw"))
