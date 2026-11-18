@@ -21,7 +21,7 @@ from pipeline import wind
 from pipeline.encode import encode_square
 from pipeline.site import build_manifest, tiles_path, wind_path
 
-from .grib import FIELDS, file_url, read_fields, read_wind
+from .grib import FIELDS, file_url, read_fields, read_layer_wind
 from .grid import SQUARES, bin_index, coverage, cut_squares, node_average
 from pipeline.squares import square_name
 
@@ -96,7 +96,7 @@ def _read_step(run, fh, get, sleep):
 def _read_wind_step(run, fh, get, sleep):
     for attempt in range(RETRIES + 1):
         try:
-            return read_wind(run, fh, get)
+            return read_layer_wind(run, fh, get)
         except Exception:
             if attempt == RETRIES:
                 raise
@@ -111,8 +111,9 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
     """wind/<run>/<group>.icw over the hours fhs; returns the manifest's `wind`
     entry, or None (any failure, or more than budget_s seconds: the files are
     removed and the cover goes out without wind). get is the limiter-wrapped
-    get the cover uses: four requests an hour (the idx, then each level's U and
-    V as one range). Groups outside WIND_GROUPS are not written."""
+    get the cover uses: per hour the two idx files, then one request per run of
+    touching rows (each level's U+V, and its CLMR+ICMR, are two ranges; PRES:surface
+    one): 39 requests an hour, every one counted by the limiter. Groups outside WIND_GROUPS are not written."""
     t0 = clock()
     deadline = t0 + budget_s
 
@@ -150,7 +151,7 @@ def build_wind(run, out_dir, get, sleep, fhs, workers, budget_s=WIND_BUDGET_S, c
         shutil.rmtree(Path(out_dir) / "wind", ignore_errors=True)
         return None
     print(f"wind: {groups} groups, {len(fhs)} steps, {total / 1e6:.1f} MB, {clock() - t0:.0f} s")
-    return wind.manifest_entry(run)
+    return wind.manifest_entry(run, layer="cloud")
 
 
 def build(run, out_dir, get, now, sleep=time.sleep, fhs=None, clock=time.monotonic):
