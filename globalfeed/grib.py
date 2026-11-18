@@ -6,7 +6,7 @@ import json
 import numpy as np
 import eccodes
 
-from pipeline import layerwind, wind
+from pipeline import layerwind
 
 G = 9.80665
 _MASS = (("ICMR", "ice"), ("CLMR", "water"))
@@ -219,9 +219,11 @@ def read_column_thick(model, run, fh, get):
 
 # ---- Wind (ICW1) --------------------------------------------------------------
 # u and v for the three decks (ICW1 keys 850 / 500 / 250 = low / mid / high, see
-# pipeline.wind.LEVELS). AIFS / IFS: the wind at those pressure levels. GFS: the
-# wind over the model's own cloud layer per deck (pipeline.layerwind), built from
-# UGRD / VGRD / TCDC at every isobaric level 1000-150 mb and the surface pressure.
+# pipeline.wind.LEVELS): each deck's wind over the model's own cloud layer
+# (pipeline.layerwind). GFS: from UGRD / VGRD / TCDC at every isobaric level
+# 1000-150 mb and the surface pressure. AIFS / IFS (no cloud on levels in their
+# open data): from u / v and the humidity run (RH >= 90 %, over ice below 0 C) at
+# every pressure level 1000-150 hPa, from q and t (both models), with sp.
 
 # GFS's isobaric levels 1000-150 hPa (all present in the 0.25 degree idx at f000 and
 # f120, checked 2026-11-18). A missing row at any of them fails the step: a level
@@ -249,24 +251,49 @@ def _ncep_wind_ranges(index_text, fh):
     return out
 
 
+# The pressure levels 1000-150 hPa each ECMWF open-data index lists for u, v, t and
+# q (AIFS 2026-11-18 00Z and IFS 2026-11-18 12Z, step 6, S3 mirror), and the
+# humidity param each model's run is found from. Both read specific humidity q:
+# AIFS publishes no r, and IFS's r is NOT RH over water below 0 C (measured
+# 2026-11-18 00Z f006 against RH from IFS's own q and t: r / RH_ice(q) = 1.00 at
+# 200-500 hPa below -23 C, r / RH_water(q) = 1.00 above 0 C; ECMWF's mixed-phase
+# saturation), so ICON's water-to-ice step on r would count the ice twice. Levels
+# above 150 hPa are never read; a missing row at any listed level fails the step,
+# as for GFS.
+AIFS_WIND_LEVELS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150)
+IFS_WIND_LEVELS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150)
+ECMWF_WIND = {"aifs": (AIFS_WIND_LEVELS, "q"), "ifs": (IFS_WIND_LEVELS, "q")}
+
+
+def _ecmwf_wind_ranges(model, index_text):
+    levels, hum = ECMWF_WIND[model.name]
+    rows = [json.loads(ln) for ln in index_text.strip().split("\n") if ln.strip()]
+
+    def find(param, levtype, lev=None):
+        r = next((r for r in rows if r.get("param") == param and r.get("levtype") == levtype
+                  and (lev is None or str(r.get("levelist")) == str(lev))), None)
+        if r is None:
+            raise KeyError(f"{param} ({levtype}{'' if lev is None else f' {lev}'}) not in index")
+        return r["_offset"], r["_offset"] + r["_length"] - 1
+
+    out = {}
+    for lev in levels:
+        for comp in ("u", "v", hum, "t"):
+            out[(lev, comp)] = find(comp, "pl", lev)
+    out[("sfc", "sp")] = find("sp", "sfc")
+    return out
+
+
 def wind_ranges(model, index_text, fh):
     """{key: (start, end)} for the wind messages of one forecast hour; end is
     inclusive or None for the file's last message. NCEP (GFS): keys
     (level hPa, 'u'|'v'|'tcdc') for each of GFS_WIND_LEVELS, plus ('sfc', 'pres'); rows picked by exact name, level and
-    forecast text ("anl" at f000). ECMWF: (level, 'u'|'v') at 850 / 500 / 250,
-    rows by param u / v, levtype pl and levelist. KeyError if a row is missing."""
+    forecast text ("anl" at f000). ECMWF: (level, 'u'|'v'|'q'|'t') for each of
+    the model's ECMWF_WIND levels, plus ('sfc', 'sp'); rows by param, levtype pl
+    (sfc for sp) and levelist. KeyError if a row is missing."""
     if model.index_kind == "ncep":
         return _ncep_wind_ranges(index_text, fh)
-    out = {}
-    rows = [json.loads(ln) for ln in index_text.strip().split("\n") if ln.strip()]
-    for lev in wind.LEVELS:
-        for comp in "uv":
-            r = next((r for r in rows if r.get("param") == comp and r.get("levtype") == "pl"
-                      and str(r.get("levelist")) == str(lev)), None)
-            if r is None:
-                raise KeyError(f"{comp} (pl {lev}) not in index")
-            out[(lev, comp)] = (r["_offset"], r["_offset"] + r["_length"] - 1)
-    return out
+    return _ecmwf_wind_ranges(model, index_text)
 
 
 def _check_message(g, want_lev, want_comp):
@@ -283,26 +310,28 @@ def _check_message(g, want_lev, want_comp):
         triple = tuple(int(eccodes.codes_get(g, k)) for k in ("discipline", "parameterCategory", "parameterNumber"))
         if level != want_lev or triple != (0, 6, 1):
             raise ValueError(f"wind: expected tcdc {want_lev} hPa, message is {short} {level} {triple}")
-    elif (short, level) != (want_comp, want_lev):
-        raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {short} {level}")
+    elif (short, level) != (want_comp, want_lev) or str(eccodes.codes_get(g, "typeOfLevel")) != "isobaricInhPa":
+        raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {short} {level} "
+                         f"{eccodes.codes_get(g, 'typeOfLevel')}")
 
 
 def read_wind_step(model, run, fh, get):
     """The wind of one forecast hour: {"lat": 1-D, "lon": 1-D (-180..180),
     (key, 'u'|'v'): float [nlat][nlon] m/s}, the source's regular grid. get(url,
     rng=None) -> bytes is injected; messages whose rows touch are fetched as one
-    range. GFS reads every level and returns the three decks' cloud-layer winds
-    under keys 850 / 500 / 250 (low / mid / high); others return the six
-    pressure-level fields as published."""
+    range. Every model reads its levels 1000-150 hPa and returns the three decks'
+    cloud-layer winds (float32) under keys 850 / 500 / 250 (low / mid / high):
+    GFS from TCDC, AIFS / IFS from the humidity run."""
     out = read_wind_fields(model, run, fh, get)
     if model.index_kind != "ncep":
-        return out
+        return ecmwf_deck_winds(model, out)
     return gfs_deck_winds(out)
 
 
 def read_wind_fields(model, run, fh, get):
-    """The messages wind_ranges asks for, decoded as {"lat", "lon", key: float32
-    [nlat][nlon]} (NaN where missing), each checked against its idx row."""
+    """The messages wind_ranges asks for, decoded as {"lat", "lon", key: [nlat][nlon]}
+    (float32 for GFS, float64 for ECMWF; NaN where missing), each checked against
+    its index row."""
     ranges = wind_ranges(model, get(model.index_url(run, fh)).decode(), fh)
     keys = list(ranges)
     url = model.url(run, fh)
@@ -344,6 +373,28 @@ def gfs_deck_winds(fields):
     v = [flat(fields[(lev, "v")]) for lev in levels]
     cloudy = [flat(fields[(lev, "tcdc")]) >= layerwind.TCDC_CLOUDY for lev in levels]   # NaN is never cloudy
     decks = layerwind.deck_winds(levels, u, v, cloudy, ps_hpa, layerwind.deck_bounds("ncep", ps_hpa))
+    for k, a in decks.items():
+        out[k] = a.reshape(shape)
+    return out
+
+
+def ecmwf_deck_winds(model, fields):
+    """read_wind_fields' AIFS / IFS result -> {"lat", "lon", (850|500|250, 'u'|'v'):
+    float32 [nlat][nlon]}: each deck's wind over its humidity run (RH >= 90 %, over
+    ice below 0 C, from q, t and the level's pressure), deck bounds 0.8 / 0.45 x
+    surface pressure (sp, Pa -> hPa)."""
+    levels, hum = ECMWF_WIND[model.name]
+    if hum != "q":
+        raise ValueError(f"{model.name}: wind humidity must be q, not {hum!r}")
+    out = {"lat": fields["lat"], "lon": fields["lon"]}
+    ps = fields[("sfc", "sp")]
+    shape = ps.shape
+    flat = lambda a: a.reshape(-1)
+    ps_hpa = flat(ps).astype(np.float64) / 100.0
+    u = [flat(fields[(lev, "u")]) for lev in levels]
+    v = [flat(fields[(lev, "v")]) for lev in levels]
+    moist = [layerwind.moist_from_q(flat(fields[(lev, "q")]), flat(fields[(lev, "t")]), lev) for lev in levels]
+    decks = layerwind.deck_winds(levels, u, v, moist, ps_hpa, layerwind.deck_bounds("ecmwf", ps_hpa))
     for k, a in decks.items():
         out[k] = a.reshape(shape)
     return out

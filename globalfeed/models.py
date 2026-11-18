@@ -51,8 +51,9 @@ class Model:
     # app's cloud drift. A failure drops the wind key; the cover goes out anyway.
     wind: bool = False
     # What the wind's three decks are: "cloud" = the mean over the model's own
-    # cloud layer in each deck (GFS), None = the wind at 850 / 500 / 250 hPa
-    # (AIFS, IFS for now). Goes into the manifest's wind entry as "layer" so a
+    # cloud layer in each deck (GFS), "humidity" = over its humidity run, RH >= 90 %
+    # (AIFS, IFS: no cloud on levels in their open data), None = the wind at
+    # 850 / 500 / 250 hPa. Goes into the manifest's wind entry as "layer" so a
     # manifest never claims a layer its wind lacks.
     wind_layer: str = None
 
@@ -112,6 +113,7 @@ AIFS = Model(
     _url="https://data.ecmwf.int/forecasts/{d}/{h:02d}z/aifs-single/0p25/oper/{d}{h:02d}0000-{f}h-oper-fc.grib2",
     _index_ext=(".grib2", ".index"),
     wind=True,
+    wind_layer="humidity",
 )
 
 
@@ -134,4 +136,5 @@ IFS = Model(
     run_hours=(0, 12),
     check_cover_units=True,
     wind=True,
+    wind_layer="humidity",
 )
