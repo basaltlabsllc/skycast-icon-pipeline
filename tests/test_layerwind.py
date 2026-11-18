@@ -15,7 +15,7 @@ def _run(levels, u, cloudy, ps, kind="ncep", v=None):
 
 def test_constants():
     assert lw.DECK_KEYS == (850, 500, 250)
-    assert lw.CONDENSATE_CLOUDY == 1e-5 and lw.TCDC_CLOUDY == 5.0 and lw.MOIST_RH == 90.0
+    assert lw.CONDENSATE_CLOUDY == 1e-6 and lw.TCDC_CLOUDY == 5.0 and lw.MOIST_RH == 90.0
 
 
 def test_no_cloud_is_weighted_deck_mean():
