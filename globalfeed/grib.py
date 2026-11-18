@@ -271,6 +271,11 @@ def read_wind_step(model, run, fh, get):
                     lon = eccodes.codes_get_array(g, "longitudes").reshape(nj, ni)
                     out["lat"] = lat[:, 0]
                     out["lon"] = np.where(lon[0] > 180, lon[0] - 360, lon[0])
+                # the index said which message this is; the bytes must agree
+                want_lev, want_comp = keys[pos]
+                got = (str(eccodes.codes_get(g, "shortName")), int(round(float(eccodes.codes_get(g, "level")))))
+                if got != (want_comp, want_lev):
+                    raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {got[0]} {got[1]}")
                 vals = eccodes.codes_get_values(g).reshape(nj, ni)
                 miss = eccodes.codes_get(g, "missingValue")
             finally:

@@ -176,3 +176,56 @@ def test_wind_skipped_when_no_time_left(monkeypatch, tmp_path, capsys):
     assert _timed_build(monkeypatch, tmp_path, 5.0, 2600.0) == []              # 2700 - 2600 - 120 < 0
     assert "::warning::wind: no time left, skipped" in capsys.readouterr().out
     assert "wind" not in json.loads((tmp_path / "manifest.json").read_text())
+
+
+def test_wind_flags():
+    assert GFS.wind and AIFS.wind and IFS.wind
+
+
+def _wind_msg(comp, lev, val):
+    import eccodes
+    h = eccodes.codes_grib_new_from_samples("regular_ll_pl_grib2")
+    for k, v in (("Ni", 2), ("Nj", 2), ("latitudeOfFirstGridPointInDegrees", 41.0),
+                 ("latitudeOfLastGridPointInDegrees", 40.0),
+                 ("longitudeOfFirstGridPointInDegrees", 250.0),
+                 ("longitudeOfLastGridPointInDegrees", 251.0),
+                 ("iDirectionIncrementInDegrees", 1.0), ("jDirectionIncrementInDegrees", 1.0),
+                 ("bitsPerValue", 24), ("discipline", 0), ("parameterCategory", 2),
+                 ("parameterNumber", 2 if comp == "u" else 3), ("typeOfFirstFixedSurface", 100),
+                 ("scaleFactorOfFirstFixedSurface", 0), ("scaledValueOfFirstFixedSurface", lev * 100)):
+        eccodes.codes_set(h, k, v)
+    eccodes.codes_set_values(h, np.full(4, float(val)))
+    b = eccodes.codes_get_message(h)
+    eccodes.codes_release(h)
+    return b
+
+
+def _ifs_order_fixture(swap=False):
+    """IFS lists v before u at each level; messages laid in that file order."""
+    order = [(lev, c) for lev in (850, 500, 250) for c in "vu"]
+    rows, buf = [], b""
+    for i, (lev, c) in enumerate(order):
+        mc = ("u" if c == "v" else "v") if (swap and (lev, c) == (500, "u")) else c
+        m = _wind_msg(mc, lev, 10 * (i + 1))
+        rows.append(_row(c, "pl", lev, len(buf), len(m)))
+        buf += m
+    idx = "\n".join(rows)
+
+    def get(url, rng=None):
+        if url.endswith(".index"):
+            return idx.encode()
+        return buf[rng[0]:rng[1] + 1]
+    return get, order
+
+
+def test_read_wind_step_ifs_order_maps_correctly():
+    get, order = _ifs_order_fixture()
+    out = grib.read_wind_step(IFS, RUN, 6, get)
+    for i, (lev, c) in enumerate(order):
+        assert out[(lev, c)][0, 0] == 10 * (i + 1)
+
+
+def test_read_wind_step_rejects_swapped_message():
+    get, _ = _ifs_order_fixture(swap=True)
+    with pytest.raises(ValueError, match="expected u 500"):
+        grib.read_wind_step(IFS, RUN, 6, get)
