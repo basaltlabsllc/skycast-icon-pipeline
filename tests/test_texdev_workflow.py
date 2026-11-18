@@ -127,3 +127,36 @@ def test_never_dispatches_anything():
 def test_publisher_uploads_and_deletes_only_under_texdev():
     out = subprocess.run(["node", "--test", "texdev.test.mjs"], cwd=ROOT / "publish", capture_output=True, text=True)
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+# ---- The cloud heights' time budget ------------------------------------------------
+
+def test_the_job_limit_the_build_reckons_with_is_the_workflows():
+    import texdev_build
+    (limit,) = re.findall(r"timeout-minutes: (\d+)", CODE)
+    assert int(limit) * 60 == texdev_build.JOB_LIMIT_S
+
+
+def test_the_build_is_told_when_the_job_began(tmp_path):
+    import texdev_build
+    all_steps = steps()
+    # The clock is read right after the branch check, before anything slow.
+    assert "name: note when the job began" in all_steps[1]
+    script = step_script("note when the job began")
+    env_file = tmp_path / "env"
+    out = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                         env=dict(os.environ, GITHUB_ENV=str(env_file)), capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    name, _, value = env_file.read_text().strip().partition("=")
+    assert name == texdev_build.JOB_START_ENV
+    import time
+    assert abs(int(value) - time.time()) < 60                    # unix seconds, now
+    assert texdev_build.job_start({name: value}, 0.0) == float(value)
+
+
+def test_the_header_names_what_the_feed_holds():
+    head = TEXT.split("\non:\n")[0]
+    assert "12 US-West" not in head
+    assert "293 squares" in head and "ICH1" in head and "heights" in head
+    import texdev_build
+    assert len(texdev_build.TEXDEV_SQUARES) == 293
