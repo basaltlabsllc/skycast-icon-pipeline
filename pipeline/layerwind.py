@@ -57,7 +57,8 @@ def moist_from_rh(rh_water_pct, t_k):
     rh = np.asarray(rh_water_pct, np.float64)
     t = np.asarray(t_k, np.float64)
     with np.errstate(invalid="ignore"):
-        return _effective_rh(rh, t) >= MOIST_RH
+        # missing T or RH is never moist (the app skips such points)
+        return np.isfinite(rh) & np.isfinite(t) & (_effective_rh(rh, t) >= MOIST_RH)
 
 
 def moist_from_q(q, t_k, p_hpa):
@@ -68,7 +69,7 @@ def moist_from_q(q, t_k, p_hpa):
     with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
         e = q * p / (0.622 + 0.378 * q)
         rh_water = 100.0 * e / _esw(t)
-        return _effective_rh(rh_water, t) >= MOIST_RH
+        return np.isfinite(rh_water) & np.isfinite(t) & (_effective_rh(rh_water, t) >= MOIST_RH)
 
 
 def deck_winds(levels_hpa, u, v, cloudy, ps, bounds):
@@ -84,6 +85,7 @@ def deck_winds(levels_hpa, u, v, cloudy, ps, bounds):
         hi = np.broadcast_to(np.asarray(hi, np.float64), ps.shape)
         bottom = np.minimum(hi, ps)
 
+        # bounds[0] must be the low deck: only it includes a level exactly at its hi (= ps).
         def member(k):
             if k < 0 or k >= p.size:
                 return np.zeros(npts, bool)
@@ -125,6 +127,8 @@ def deck_winds(levels_hpa, u, v, cloudy, ps, bounds):
             m_prev, m_cur = m_cur, m_next
         close_runs(np.ones(npts, bool))
 
+        # A single cloudy pressure level is a valid run (unlike deckOf's fine grid,
+        # where seg.length < 2 falls back to the band): pressure levels are coarse.
         use_run = best_w > 0
         su = np.where(use_run, best_u, all_u)
         sv = np.where(use_run, best_v, all_v)

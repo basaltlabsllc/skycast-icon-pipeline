@@ -193,3 +193,24 @@ def test_moist_from_rh_ice_conversion():
     assert 85 * _esw(250.0) / _esi(250.0) == pytest.approx(106.98305404307902)
     out = lw.moist_from_rh(np.array([85.0, 85.0, 90.0, 89.9, np.nan]), np.array([250.0, 280.0, 280.0, 280.0, 280.0]))
     assert out.tolist() == [True, False, True, False, False]
+
+
+def test_underground_deck_bottom_is_ps():
+    # ncep, ps 600: 700 is underground. Mid deck = 600 .. 350 (bottom min(642, ps)):
+    #   600: 600 - 550 = 50   500: 550 - 450 = 100   400: 450 - 350 = 100
+    # High deck = 350 .. 150: 300 alone. Low deck (600 .. 642) is empty.
+    levels = [700, 600, 500, 400, 300]
+    u = [99, 2, 4, 8, 16]
+    out = _run(levels, u, [False] * 5, 600.0)
+    assert np.isnan(out[(850, "u")][0]) and np.isnan(out[(850, "v")][0])
+    assert out[(500, "u")][0] == pytest.approx((50 * 2 + 100 * 4 + 100 * 8) / 250.0, rel=1e-6)
+    assert out[(250, "u")][0] == pytest.approx(16.0)
+    # runs {600} (50) and {400} (100): the thicker {400} wins
+    out = _run(levels, u, [False, True, False, True, False], 600.0)
+    assert out[(500, "u")][0] == pytest.approx(8.0)
+
+
+def test_missing_t_or_humidity_is_never_moist():
+    nan = np.nan
+    assert lw.moist_from_rh(np.array([95.0, nan, 95.0]), np.array([nan, 280.0, np.inf])).tolist() == [False, False, False]
+    assert lw.moist_from_q(np.array([0.013, nan]), np.array([nan, 290.0]), np.array([850.0, 850.0])).tolist() == [False, False]
