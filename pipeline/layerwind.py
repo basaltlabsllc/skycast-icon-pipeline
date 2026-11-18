@@ -17,7 +17,7 @@
 import numpy as np
 
 DECK_KEYS = (850, 500, 250)          # ICW1 keys: low, mid, high deck
-CONDENSATE_CLOUDY = 1e-5             # kg/kg cloud water + ice (HRRR, RRFS)
+CONDENSATE_CLOUDY = 1e-6             # kg/kg cloud water + ice (HRRR, RRFS)
 TCDC_CLOUDY = 5.0                    # % (GFS)
 MOIST_RH = 90.0                      # % effective RH (ICON, IFS, AIFS)
 DECK_TOP = 150.0                     # hPa

@@ -142,7 +142,10 @@ def hrrr_threshold(argv):
     bidx = np.clip(np.rint((1000.0 - base) / 50.0), 0, len(levels) - 1)
     print(f"HRRR {run:%Y-%m-%d %HZ} f{fh:03d}: {ps.size} cells, {int(has_base.sum())} with a PRES:cloud base "
           f"({100.0 * has_base.mean():.1f} %)")
-    print("threshold kg/kg   compared  within 1 level (share)   exact level (share)   base, no cloudy level   cloudy level, no base")
+    nb = int(has_base.sum())
+    print("share within one level / exact level, two denominators: BOTH = cells with a base and a cloudy level "
+          "(shrinks as the threshold rises, so it flatters a strict one); ALL = every cell with a base (fair)")
+    print("threshold kg/kg  | BOTH n  within1  exact | ALL n  within1  exact | base, no cloudy level | cloudy level, no base")
     shares = {}
     for thr in (1e-6, 1e-5, 1e-4):
         low = np.full(ps.shape, -1.0)               # index of the lowest cloudy level above ground, -1 = none
@@ -153,13 +156,13 @@ def hrrr_threshold(argv):
         both = has_base & has_cloudy
         d = np.abs(low[both] - bidx[both])
         n1, n0, n = int((d <= 1).sum()), int((d == 0).sum()), int(both.sum())
-        a = n1 / n
-        print(f"{thr:10.0e}   {n:11d}  {n1:12d} ({100 * a:5.1f} %)  {n0:11d} ({100 * n0 / n:5.1f} %)  "
-              f"{int((has_base & ~has_cloudy).sum()):14d}          {int((~has_base & has_cloudy).sum()):14d}")
-        shares[thr] = a
+        print(f"{thr:10.0e}       | {n:8d} {100 * n1 / n:6.1f} % {100 * n0 / n:6.1f} % | {nb:8d} {100 * n1 / nb:6.1f} % "
+              f"{100 * n0 / nb:6.1f} % | {int((has_base & ~has_cloudy).sum()):14d} | {int((~has_base & has_cloudy).sum()):14d}")
+        print(f"                   counts: both within1 {n1}, exact {n0}")
+        shares[thr] = n1 / nb
     top = max(shares, key=shares.get)
     pick = 1e-5 if shares[1e-5] >= shares[top] - 0.02 else top      # a tie within 2 points keeps 1e-5
-    print(f"best share {100 * shares[top]:.1f} % at {top:.0e}; chosen {pick:.0e} "
+    print(f"best ALL share {100 * shares[top]:.1f} % at {top:.0e}; chosen {pick:.0e} "
           f"({100 * shares[pick]:.1f} %; a tie within 2 points keeps 1e-5)")
     print(f"peak RSS {peak_rss_mb():.0f} MB")
 
