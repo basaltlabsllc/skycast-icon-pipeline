@@ -18,8 +18,12 @@
 # history lives in its own state dir: state/upper (run_build.UPPER_SUB) and
 # state/texdev_columns (the column heads the clue history is rebuilt from).
 import argparse
+import functools
 import json
+import multiprocessing as mp
 import os
+import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -62,7 +66,17 @@ COLUMN_SUB = "texdev_columns"
 # enough by itself: one of them would have had a minute.
 JOB_LIMIT_S = 150 * 60
 JOB_RESERVE_S = 15 * 60
-JOB_START_ENV = "TEXDEV_JOB_START"       # unix seconds, set by the workflow's second step
+JOB_START_ENV = "TEXDEV_JOB_START"       # unix seconds, set by this branch's workflow's second step
+# The scheduled runs are fired by MAIN's copy of texdev.yml, which builds this
+# branch's code and does not set that variable. The job is then taken to have
+# begun this long before the build did: checkout, the cdo install, pip, the
+# whole test suite and the state fetch come first (10 to 16 min by the review
+# of 2026-11-17; the pytest step alone took 7 to 13 min in the five newest runs).
+PREBUILD_ALLOWANCE_S = 20 * 60
+# The heights' process hands its manifest entry back in this file in the work
+# dir: {"entry": {...}} when the files are written, {"entry": null} when it
+# gave up cleanly (it printed why). Written whole, then renamed into place.
+HEIGHTS_RESULT = "heights-result.json"
 
 
 def job_start(env, fallback):
@@ -89,8 +103,127 @@ def manifest(run, built, names, upper, clues, heights=None):
     return json.dumps(out, separators=(",", ":"))
 
 
-def build(out, state, work, deps, steps=None, workers=None, squares=None, env=None, clock=time.time):
-    began = job_start(os.environ if env is None else env, clock())
+def _real_heights(blob_dir, state, work, *args, **kw):
+    return run_build.build_heights(blob_dir, state, work, run_build.REAL, *args, **kw)
+
+
+def heights_job_for(deps, blob_dir, state, work, *args, **kw):
+    """What the heights' process runs: run_build.build_heights with these
+    arguments (those after its `deps`). The real deps hold lambdas, which a
+    fresh interpreter cannot be handed, so for them it looks REAL up itself."""
+    if deps is run_build.REAL:
+        return functools.partial(_real_heights, blob_dir, state, work, *args, **kw)
+    return functools.partial(run_build.build_heights, blob_dir, state, work, deps, *args, **kw)
+
+
+def _heights_child(job, result):
+    os.setsid()                              # a process group of its own: cdo and all die with it
+    entry = job()
+    tmp = result.with_name(result.name + ".tmp")
+    tmp.write_text(json.dumps({"entry": entry}))
+    os.replace(tmp, result)
+
+
+def run_heights_child(job, budget_s, result, start="spawn"):
+    """Run job() in a child process for at most `budget_s` seconds; its return
+    value goes to the file `result`. Returns None when the child exited 0,
+    else why it did not. A child still running at the deadline, or one that
+    died, is killed with its whole process group, so nothing it started
+    outlives it. start: "spawn", a fresh interpreter, never a fork of this
+    threaded one (as run_build.clue_cubes); the tests fork, to hand over fakes."""
+    result.unlink(missing_ok=True)
+    child = mp.get_context(start).Process(target=_heights_child, args=(job, result))
+    child.start()
+    why = "their process could not be waited for"
+    try:
+        child.join(budget_s)
+        if child.is_alive():
+            why = f"out of time: {budget_s / 60:.0f} min were allowed, and their process was stopped"
+        elif child.exitcode == 0:
+            why = None
+        elif child.exitcode < 0:
+            why = f"their process was killed by signal {-child.exitcode}"
+        else:
+            why = f"their process ended with exit code {child.exitcode}"
+    finally:
+        if why is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass                         # no such group: it never got as far as setsid, or all are gone
+            if child.is_alive():
+                child.kill()
+            child.join()
+    return why
+
+
+def read_heights_result(result, root, run, names, clues):
+    """(entry, None) from the child's result file — entry None when the child
+    gave up cleanly — or (None, why) when the result is not a whole heights
+    build of this run: the entry of this format and folder on the clue files'
+    steps, and one file for every square."""
+    try:
+        got = json.loads(Path(result).read_text())
+    except (OSError, ValueError) as e:
+        return None, f"no result from their process ({type(e).__name__})"
+    if not isinstance(got, dict) or "entry" not in got:
+        return None, "malformed result from their process"
+    entry = got["entry"]
+    if entry is None:
+        return None, None
+    tiles = run_build.site.heights_path(run)
+    if not isinstance(entry, dict) or entry.get("format") != run_build.heights.FORMAT or entry.get("tiles") != tiles \
+            or entry.get("steps") != clues["steps"]:
+        return None, "malformed result from their process (not this run's entry)"
+    lacking = [n for n in names if not (Path(root) / tiles / f"{n}.ich").is_file()]
+    if lacking:
+        return None, f"malformed result from their process ({len(lacking)} files not written, first {lacking[0]})"
+    return entry, None
+
+
+def drop_heights(root, state, run, head=True):
+    """Remove this build's height files and, with `head`, this run's kept head."""
+    shutil.rmtree(Path(root) / run_build.site_heights_root(), ignore_errors=True)
+    if head:
+        d = run_build.history.history_dir(state, run_build.HEIGHTS_SUB)
+        for p in d.glob(f"{dwd.run_id(run)}*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def heights_extra(root, state, work, run, names, clues, budget, job, start="spawn"):
+    """The cloud heights, run in a process of their own: the manifest entry,
+    or None with a warning and no height file left. Never raises."""
+    try:
+        short = run_build.heights_too_short(budget)
+        if short:
+            print(f"::warning::heights skipped: {short}")
+            return None
+        result = Path(work) / HEIGHTS_RESULT
+        why = run_heights_child(job, budget, result, start)
+        if why is None:
+            entry, why = read_heights_result(result, root, run, names, clues)
+            if why is None:
+                if entry is None:            # it gave up cleanly and said why; nothing is half-written
+                    drop_heights(root, state, run, head=False)
+                return entry
+    except Exception as e:
+        why = f"{type(e).__name__}: {e}"
+    try:
+        print(f"::warning::heights failed: {why}")
+        drop_heights(root, state, run)
+    except Exception:
+        pass
+    return None
+
+
+def build(out, state, work, deps, steps=None, workers=None, squares=None, env=None, clock=time.time,
+          heights_job=None, heights_start="spawn"):
+    # heights_job: what the heights' process runs (testing); None for the real
+    # thing. heights_start: how that process is started (run_heights_child).
+    began = job_start(os.environ if env is None else env, clock() - PREBUILD_ALLOWANCE_S)
     run = dwd.newest_complete_run(deps.listing)
     if run is None:
         print("no complete run on DWD yet")
@@ -107,14 +240,32 @@ def build(out, state, work, deps, steps=None, workers=None, squares=None, env=No
     if upper is None or clues is None:
         print(f"::error::texdev: run {dwd.run_iso(run)} built no upper air — nothing published")
         return run_build.FAILED
-    # The cloud heights come last and are an extra: whatever happens to them,
-    # the files above are already written and the manifest names them.
-    budget = heights_budget(began, clock())
-    print(f"texdev: heights may take {budget / 60:.0f} min ({(clock() - began) / 60:.0f} min of the job's "
-          f"{JOB_LIMIT_S // 60} used)")
-    heights = run_build.build_heights(root, Path(state), work, deps, kit, run, steps, names,
-                                      [ms // 3600000 for ms in clues["steps"]], workers, budget_s=budget)
-    (root / "manifest.json").write_text(manifest(run, deps.now(), names, upper, clues, heights))
+    # The build without heights is whole on disk, manifest included, before the
+    # heights start. They are an extra, run in a process of their own with a
+    # hard deadline: only when that process ends well is the manifest written
+    # again with their key, and whatever else happens this run is BUILT.
+    built = deps.now()
+    (root / "manifest.json").write_text(manifest(run, built, names, upper, clues))
+    try:
+        now = clock()
+        budget = heights_budget(began, now)
+        print(f"texdev: heights may take {budget / 60:.0f} min ({(now - began) / 60:.0f} min of the job's "
+              f"{JOB_LIMIT_S // 60} used)")
+        job = heights_job or heights_job_for(
+            deps, root, Path(state), work, kit, run, steps, names,
+            [ms // 3600000 for ms in clues["steps"]], workers, budget_s=budget)
+        entry = heights_extra(root, Path(state), work, run, names, clues, budget, job, heights_start)
+        if entry is not None:
+            tmp = root / "manifest.json.tmp"
+            try:
+                tmp.write_text(manifest(run, built, names, upper, clues, entry))
+                os.replace(tmp, root / "manifest.json")
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                drop_heights(root, Path(state), run)
+                raise
+    except Exception as e:
+        print(f"::warning::heights failed: {type(e).__name__}: {e}")
     return run_build.BUILT
 
 

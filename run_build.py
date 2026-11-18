@@ -1051,18 +1051,48 @@ def build_upper_and_clues(blob_dir, state, work, deps, kit, run, steps, squares,
 # Each deck's real base and top from CLC on model levels and HHL, one file per
 # square beside the clue files, on the clue files' hours. They are an extra:
 # nothing here may cost a run its upper air or clues, so build_heights never
-# raises, never waits for DWD, and stops when its time is up.
+# raises, never waits for DWD, and stops when its time is up. That stop is a
+# soft one (between files); texdev_build runs build_heights in a process of
+# its own and kills it at the same budget, which is the hard one.
 #
 # Time. Measured on the 4-core runner with the same 16 fetch threads
 # (tools/measure_heights.py, 2026-11-17): 9.3 min a run to download and remap
 # the 3,255 CLC files (6.07 GB) plus 55 s for the 36 HHL files. The budget is
 # three times that; texdev_build shortens it to what the job has left.
 HEIGHTS_BUDGET_S = 30 * 60
+# Under this they are not started: the same measurement's 9.3 min + 55 s is
+# 10.3 min for the 293 squares x 93 steps, and a budget that cannot finish is
+# only time taken from the publish. 13 min is that plus a margin.
+HEIGHTS_MIN_BUDGET_S = 13 * 60
 HEIGHTS_SUB = "heights"
 
 
 def site_heights_root():
     return "heights"
+
+
+def heights_too_short(budget_s):
+    """Why `budget_s` is not worth starting the heights on, or None."""
+    if budget_s >= HEIGHTS_MIN_BUDGET_S:
+        return None
+    return (f"no time left in the job ({budget_s / 60:.0f} min; they are not started with under "
+            f"{HEIGHTS_MIN_BUDGET_S / 60:.0f} min)")
+
+
+def _drop_unreadable_heads(state, sub):
+    """A kept head that cannot be read (cut short, not a zip) is deleted with
+    a warning, so it is treated as absent on this run and every later one —
+    left in place it would fail the load each time. Its hours come out UNKNOWN."""
+    for p in sorted(history.history_dir(state, sub).glob("*.npz")):
+        try:
+            with np.load(p) as z:
+                int(z["run_hour"]), z["head"].shape
+        except Exception as e:
+            print(f"::warning::heights: kept head {p.name} is unreadable ({type(e).__name__}: {e}) — dropped")
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 class _OutOfTime(Exception):
@@ -1173,8 +1203,9 @@ def build_heights(blob_dir, state, work, deps, kit, run, steps, squares, hours, 
             raise _OutOfTime(f"out of time: {budget_s / 60:.0f} min were allowed")
 
     try:
-        if budget_s <= 0:
-            print(f"::warning::heights skipped: no time left in the job ({budget_s / 60:.0f} min)")
+        short = heights_too_short(budget_s)
+        if short:
+            print(f"::warning::heights skipped: {short}")
             return None
         missing = dwd.missing_height_files(deps.listing, run, steps)
         if missing:
@@ -1187,6 +1218,7 @@ def build_heights(blob_dir, state, work, deps, kit, run, steps, squares, hours, 
         base = history.hour_of(run)
         own = fetch_heights(deps, kit, work, run, steps, column_fetch_workers(), stride, window, check)
         t1 = clock()
+        _drop_unreadable_heads(state, HEIGHTS_SUB)
         by = dict(_windowed_history(state, run, HEIGHTS_SUB, window, stride, (heights.N_BYTES,) + crop_shape, rule))
         n_kept = len(by)
         by.update(own)
@@ -1201,18 +1233,20 @@ def build_heights(blob_dir, state, work, deps, kit, run, steps, squares, hours, 
             _save_windowed_head(state, run, HEIGHTS_SUB, window, stride,
                                 np.stack([own_by[base + s] for s in head_steps]), dtype=np.uint8, split=False,
                                 rule=rule)
+        # Still inside the try: nothing after the files may raise either.
+        print(f"heights: {len(names)} squares, {len(hours)} steps ({n_kept} kept from earlier runs, "
+              f"{len(gap)} unknown), {heights.FORMAT} {total / 1e6:.1f} MB, {clock() - t0:.0f} s "
+              f"(fetch {t1 - t0:.0f} s) of {budget_s:.0f} s allowed")
+        entry = _tex_entry(heights.FORMAT, run, hours, sum(1 for h in hours if h < base), stride,
+                           site.heights_path(run))
+        entry.update({"threshold": _whole(rule["threshold"]), "levels": rule["levels"],
+                      "stepM": _whole(rule["stepM"]), "bytes": heights.N_BYTES, "noLevel": heights.NO_LEVEL,
+                      "unknown": heights.UNKNOWN, "topAtReachFlag": heights.FLAG_TOP_AT_REACH})
+        return entry
     except Exception as e:
         print(f"::warning::heights failed: {type(e).__name__}: {e}")
         shutil.rmtree(Path(blob_dir) / site_heights_root(), ignore_errors=True)
         return None
-    print(f"heights: {len(names)} squares, {len(hours)} steps ({n_kept} kept from earlier runs, "
-          f"{len(gap)} unknown), {heights.FORMAT} {total / 1e6:.1f} MB, {clock() - t0:.0f} s "
-          f"(fetch {t1 - t0:.0f} s) of {budget_s:.0f} s allowed")
-    entry = _tex_entry(heights.FORMAT, run, hours, sum(1 for h in hours if h < base), stride, site.heights_path(run))
-    entry.update({"threshold": _whole(rule["threshold"]), "levels": rule["levels"], "stepM": _whole(rule["stepM"]),
-                  "bytes": heights.N_BYTES, "noLevel": heights.NO_LEVEL, "unknown": heights.UNKNOWN,
-                  "topAtReachFlag": heights.FLAG_TOP_AT_REACH})
-    return entry
 
 
 def main():

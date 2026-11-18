@@ -4,7 +4,11 @@
 # heights writes them. Nothing here touches the network.
 import datetime as dt
 import json
+import os
 import re
+import signal
+import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -91,8 +95,17 @@ def _hdeps(run=RUN, steps=(0, 1), unlisted=(), **fake):
 
 
 def _build(tmp_path, deps, steps=(0, 1), out="out", state="state", **kw):
+    # "fork": the fake deps here are closures, which only a fork can hand to
+    # the heights' process. The real build starts a fresh interpreter ("spawn").
+    kw.setdefault("heights_start", "fork")
     return texdev_build.build(tmp_path / out, tmp_path / state, tmp_path / "work", deps,
                               steps=list(steps), workers=2, squares=SQUARES, **kw)
+
+
+def _spawned_job(marker, entry):
+    """A heights job a fresh interpreter can import (the real start method)."""
+    Path(marker).write_text(f"{os.getpid()} {os.getsid(0)}")
+    return entry
 
 
 def _manifest(tmp_path, out="out"):
@@ -101,6 +114,15 @@ def _manifest(tmp_path, out="out"):
 
 def _files(root):
     return {str(p.relative_to(root)): p.read_bytes() for p in sorted(Path(root).rglob("*")) if p.is_file()}
+
+
+def _direct(tmp_path, deps, steps=(0, 1), **kw):
+    """run_build.build_heights in THIS process (the build runs it in a child,
+    whose lists of calls a test cannot see)."""
+    root, state, work = tmp_path / "direct" / "texdev", tmp_path / "direct-state", tmp_path / "direct-work"
+    work.mkdir(parents=True, exist_ok=True)
+    return run_build.build_heights(root, state, work, deps, Path("/kit"), RUN, list(steps), SQUARES,
+                                   [hour_of(RUN) + s for s in steps], 2, **kw)
 
 
 def _b(metres):
@@ -196,7 +218,7 @@ def test_the_file_holds_the_clue_files_steps_and_the_decks_of_the_column(tmp_pat
 def test_each_model_level_file_is_decoded_on_its_own(tmp_path):
     calls = []
     steps = [0, 1]
-    _build(tmp_path, _hdeps(steps=steps, calls=calls), steps)
+    assert _direct(tmp_path, _hdeps(steps=steps, calls=calls), steps) is not None
     files = dwd.height_files(RUN, steps)
     clc = [n for n in calls if "_CLC." in n]
     assert sorted(clc) == sorted(files["CLC"])
@@ -251,23 +273,24 @@ def test_with_heights_the_other_files_are_byte_for_byte_the_same(tmp_path):
 
 
 @pytest.mark.parametrize("unlisted", ["_000_100_CLC.", "_90_HHL."])
-def test_a_file_missing_from_dwds_listing_drops_only_the_heights(tmp_path, capsys, unlisted):
+def test_a_file_missing_from_dwds_listing_drops_only_the_heights(tmp_path, capfd, unlisted):
     steps = [0, 1]
-    calls = []
-    assert _build(tmp_path, _hdeps(steps=steps, unlisted=[unlisted], calls=calls), steps) == run_build.BUILT
-    out = capsys.readouterr().out
+    assert _build(tmp_path, _hdeps(steps=steps, unlisted=[unlisted]), steps) == run_build.BUILT
+    out = capfd.readouterr().out
     assert "::warning::heights" in out and "not listed" in out and unlisted.strip("_.").split("_")[-1] in out
-    assert not [n for n in calls if "_CLC." in n]             # nothing was downloaded for them
-    _same_but_for_heights(tmp_path, steps, capsys, out)
+    _same_but_for_heights(tmp_path, steps, capfd, out)
+    calls = []
+    assert _direct(tmp_path, _hdeps(steps=steps, unlisted=[unlisted], calls=calls), steps) is None
+    assert not [n for n in calls if "_CLC." in n or "_HHL." in n]     # nothing was downloaded for them
 
 
-def test_a_broken_file_drops_only_the_heights(tmp_path, capsys):
+def test_a_broken_file_drops_only_the_heights(tmp_path, capfd):
     steps = [0, 1]
     assert _build(tmp_path, _hdeps(steps=steps, fail="_001_95_CLC."), steps) == run_build.BUILT
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     assert "::warning::heights failed" in out and "_001_95_CLC." in out
-    _same_but_for_heights(tmp_path, steps, capsys, out)
-    assert not (tmp_path / "state" / run_build.HEIGHTS_SUB).exists()      # no half run kept as history
+    _same_but_for_heights(tmp_path, steps, capfd, out)
+    assert not list((tmp_path / "state").glob(f"{run_build.HEIGHTS_SUB}/*.npz"))   # no half run kept as history
 
 
 def test_out_of_time_before_it_starts_drops_only_the_heights(tmp_path, capsys):
@@ -313,19 +336,252 @@ def test_the_budget_is_the_smaller_of_its_own_and_what_the_job_has_left():
     assert texdev_build.heights_budget(1000.0, 1000.0 + 60 * 60) == own                    # plenty left
     assert texdev_build.heights_budget(1000.0, 1000.0 + limit - reserve - 600) == 600      # ten minutes left
     assert texdev_build.heights_budget(1000.0, 1000.0 + limit) == -reserve                 # none
-    # The job's start comes from the workflow; without it, from the build's own start.
+    # The job's start comes from the workflow; without it, from what the build hands in.
     assert texdev_build.job_start({"TEXDEV_JOB_START": "1763373600"}, 5.0) == 1763373600.0
     for bad in ({}, {"TEXDEV_JOB_START": ""}, {"TEXDEV_JOB_START": "soon"}):
         assert texdev_build.job_start(bad, 5.0) == 5.0
 
 
-def test_heights_run_after_the_other_files_are_written():
-    # A heights failure cannot touch what is already on disk, and the budget is
-    # measured once the long part of the build is over.
+def test_heights_run_after_everything_else_is_written_the_manifest_included(tmp_path):
+    # What the heights' own process finds on disk when it starts is a whole
+    # build without heights: whatever then happens to it costs nothing.
+    steps = [0, 1]
+    seen = tmp_path / "seen.json"
+    root = tmp_path / "out" / "texdev"
+
+    def job():
+        seen.write_text(json.dumps({"manifest": json.loads((root / "manifest.json").read_text()),
+                                    "files": sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()),
+                                    "pid": os.getpid()}))
+        return None
+
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    got = json.loads(seen.read_text())
+    want = _plain(tmp_path, steps)
+    assert got["files"] == sorted(want)
+    assert got["manifest"] == json.loads(want["manifest.json"]) and "heights" not in got["manifest"]
+    assert got["pid"] != os.getpid()                              # their own process
+    assert _manifest(tmp_path) == got["manifest"]
+
+
+# ---- the heights' own process: a hard stop, and nothing it does costs the run -----------
+
+def _dropped(tmp_path, steps, out, why):
+    assert "::warning::heights failed" in out and why in out, out
+    _same_but_for_heights(tmp_path, steps, None, out)
+    assert not list((tmp_path / "state").glob(f"{run_build.HEIGHTS_SUB}/{dwd.run_id(RUN)}*"))
+
+
+def _litter(tmp_path):
+    """What a heights build leaves when it dies partway: files and a state head."""
+    tiles = tmp_path / "out" / "texdev" / site.heights_path(RUN)
+    tiles.mkdir(parents=True)
+    (tiles / f"{SQUARES[0]}.ich").write_bytes(b"ICH1 half a file")
+    head = tmp_path / "state" / run_build.HEIGHTS_SUB
+    head.mkdir(parents=True, exist_ok=True)
+    (head / f"{dwd.run_id(RUN)}.npz").write_bytes(b"half a head")
+
+
+def test_a_heights_process_that_exits_non_zero_drops_only_the_heights(tmp_path, capfd):
+    steps = [0, 1]
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=lambda: os._exit(3)) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, "exit code 3")
+
+
+def test_a_heights_process_killed_by_a_signal_drops_only_the_heights(tmp_path, capfd):
+    steps = [0, 1]
+    job = lambda: os.kill(os.getpid(), signal.SIGKILL)
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, f"signal {int(signal.SIGKILL)}")
+
+
+def test_a_heights_process_that_writes_files_and_dies_leaves_none_of_them(tmp_path, capfd):
+    steps = [0, 1]
+
+    def job():
+        _litter(tmp_path)
+        os._exit(1)
+
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, "exit code 1")
+
+
+def test_a_heights_process_that_raises_drops_only_the_heights(tmp_path, capfd):
+    steps = [0, 1]
+
+    def job():
+        _litter(tmp_path)
+        raise MemoryError("fake")
+
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, "exit code 1")
+
+
+def _gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_a_heights_process_that_outlives_its_time_is_killed_with_everything_it_started(tmp_path, capfd, monkeypatch):
+    steps = [0, 1]
+    monkeypatch.setattr(run_build, "HEIGHTS_BUDGET_S", 0.5)
+    monkeypatch.setattr(run_build, "HEIGHTS_MIN_BUDGET_S", 0.0)
+    pids = tmp_path / "pids"
+
+    def job():
+        _litter(tmp_path)
+        hung = subprocess.Popen(["sleep", "600"])                 # a cdo that never returns
+        pids.write_text(f"{os.getpid()} {hung.pid}")
+        time.sleep(600)
+
+    t0 = time.monotonic()
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    took = time.monotonic() - t0
+    out = capfd.readouterr().out
+    child, hung = (int(p) for p in pids.read_text().split())
+    until = time.monotonic() + 5
+    while not (_gone(child) and _gone(hung)) and time.monotonic() < until:
+        time.sleep(0.05)
+    assert _gone(child) and _gone(hung)
+    _dropped(tmp_path, steps, out, "out of time")
+    assert took < 60                                              # nowhere near the 600 s it wanted
+
+
+def test_the_real_build_starts_the_heights_in_a_fresh_interpreter(tmp_path, monkeypatch):
+    import functools
     import inspect
-    src = inspect.getsource(texdev_build.build)
-    assert src.index("build_upper_and_clues") < src.index("heights_budget") < src.index("build_heights") \
-        < src.index("manifest.json")
+    import pickle
+    assert inspect.signature(texdev_build.build).parameters["heights_start"].default == "spawn"
+    assert inspect.signature(texdev_build.run_heights_child).parameters["start"].default == "spawn"
+    # What the real build hands that interpreter can be handed over (pickled),
+    # and is build_heights with the real deps and the build's own arguments.
+    args = (tmp_path / "blob", tmp_path / "state", tmp_path / "work", Path("/kit"), RUN, [0, 1], SQUARES, [1, 2], 6)
+    job = pickle.loads(pickle.dumps(texdev_build.heights_job_for(run_build.REAL, *args, budget_s=900.0)))
+    got = []
+    monkeypatch.setattr(run_build, "build_heights", lambda *a, **kw: got.append((a, kw)) or {"an": "entry"})
+    assert job() == {"an": "entry"}
+    ((a, kw),) = got
+    assert a[:3] == args[:3] and a[3] is run_build.REAL and a[4:] == args[3:] and kw == {"budget_s": 900.0}
+    monkeypatch.undo()
+    names = list(inspect.signature(run_build.build_heights).parameters)[:10]
+    assert names == ["blob_dir", "state", "work", "deps", "kit", "run", "steps", "squares", "hours", "workers"]
+    # ... and a job run that way hands its result back from a session of its own.
+    marker, result = tmp_path / "marker", tmp_path / "result.json"
+    job = functools.partial(_spawned_job, str(marker), {"format": "ICH1"})
+    assert texdev_build.run_heights_child(job, 300.0, result) is None
+    assert json.loads(result.read_text()) == {"entry": {"format": "ICH1"}}
+    pid, sid = (int(x) for x in marker.read_text().split())
+    assert pid == sid and pid != os.getpid()
+
+
+@pytest.mark.parametrize("what", ["not a dict", "another format", "other steps", "files missing", "no result"])
+def test_a_result_that_is_not_what_was_asked_for_drops_only_the_heights(tmp_path, capfd, what):
+    steps = [0, 1]
+    assert _build(tmp_path, _hdeps(steps=steps), steps, out="good", state="good-state") == run_build.BUILT
+    entry = _manifest(tmp_path, "good")["heights"]
+    capfd.readouterr()
+
+    def job():
+        if what == "files missing":
+            return entry                                          # a fine entry, and no file written
+        _litter(tmp_path)
+        if what == "no result":
+            os._exit(0)                                           # "fine", and nothing to show for it
+        if what == "not a dict":
+            return ["ICH1"]
+        if what == "another format":
+            return dict(entry, format="ICH9")
+        return dict(entry, steps=entry["steps"][:-1])
+
+    assert _build(tmp_path, _hdeps(steps=steps), steps, heights_job=job) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, "result")
+
+
+def test_nothing_that_goes_wrong_around_the_heights_process_costs_the_run(tmp_path, capfd, monkeypatch):
+    steps = [0, 1]
+
+    def broken(job, budget_s, result, start):
+        _litter(tmp_path)
+        raise RuntimeError("fake: could not start a process")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(texdev_build, "run_heights_child", broken)
+        assert _build(tmp_path, _hdeps(steps=steps), steps) == run_build.BUILT
+    _dropped(tmp_path, steps, capfd.readouterr().out, "could not start a process")
+
+
+def test_an_error_after_the_height_files_are_written_still_only_drops_the_heights(tmp_path, capsys, monkeypatch):
+    # The summary line and the manifest entry come after the files: an error
+    # there is a heights failure like any other, never one that escapes.
+    def boom(x):
+        raise TypeError("fake: the entry cannot be built")
+
+    monkeypatch.setattr(run_build, "_whole", boom)
+    assert _direct(tmp_path, _hdeps()) is None
+    out = capsys.readouterr().out
+    assert "::warning::heights failed" in out and "the entry cannot be built" in out
+    assert not (tmp_path / "direct" / "texdev" / "heights").exists()
+
+
+# ---- time -------------------------------------------------------------------------------
+
+def _budget_given(tmp_path, monkeypatch, env, clock, out="out"):
+    """The budget the heights' process is started with (None: never started)."""
+    got = []
+
+    def spy(job, budget_s, result, start):
+        got.append(budget_s)
+        return "fake: not run"
+
+    monkeypatch.setattr(texdev_build, "run_heights_child", spy)
+    assert _build(tmp_path, _hdeps(), out=out, state=f"{out}-state", env=env, clock=clock) == run_build.BUILT
+    return got[0] if got else None
+
+
+def _clock(t0, later):
+    """The build's first look at the clock is t0; every later one, `later`."""
+    seen = []
+
+    def clock():
+        seen.append(1)
+        return t0 if len(seen) == 1 else later
+
+    return clock
+
+
+def test_without_the_workflows_clock_the_job_is_taken_to_have_begun_20_min_before_the_build(tmp_path, monkeypatch):
+    # The scheduled runs (main's texdev.yml) do not set TEXDEV_JOB_START. The
+    # build then starts after checkout, cdo, pip and the whole test suite.
+    limit, reserve, pre = texdev_build.JOB_LIMIT_S, texdev_build.JOB_RESERVE_S, texdev_build.PREBUILD_ALLOWANCE_S
+    assert pre == 20 * 60
+    t0, phase = 1_763_373_600.0, 100 * 60.0                       # upper air and clues took 100 min
+    got = _budget_given(tmp_path, monkeypatch, {}, _clock(t0, t0 + phase))
+    # It ends 15 min before the limit counted from 20 min before the build began.
+    assert t0 + phase + got == (t0 - pre) + limit - reserve
+    assert got == 15 * 60
+    # Told when the job began (here: just before the build), it has its whole own budget.
+    got = _budget_given(tmp_path, monkeypatch, {"TEXDEV_JOB_START": str(int(t0))}, _clock(t0, t0 + phase), out="told")
+    assert got == run_build.HEIGHTS_BUDGET_S
+
+
+def test_a_budget_too_small_to_finish_is_not_spent(tmp_path, capsys, monkeypatch):
+    need = run_build.HEIGHTS_MIN_BUDGET_S
+    assert need == 13 * 60
+    limit, reserve = texdev_build.JOB_LIMIT_S, texdev_build.JOB_RESERVE_S
+    env = {"TEXDEV_JOB_START": "1000"}
+    at = lambda left: (lambda: 1000.0 + limit - reserve - left)   # `left` seconds of budget remain
+    assert _budget_given(tmp_path, monkeypatch, env, at(need - 1)) is None
+    out = capsys.readouterr().out
+    assert "::warning::heights skipped" in out and "no time left" in out and "13 min" in out
+    assert "heights" not in _manifest(tmp_path)
+    assert _budget_given(tmp_path, monkeypatch, env, at(need), out="enough") == need
+    # build_heights called by itself refuses the same way, reading nothing.
+    calls = []
+    assert _direct(tmp_path, _hdeps(calls=calls), budget_s=need - 1) is None
+    assert calls == [] and "no time left" in capsys.readouterr().out
 
 
 # ---- history ----------------------------------------------------------------------------
@@ -375,11 +631,34 @@ def test_history_kept_under_another_rule_is_not_read(tmp_path, monkeypatch):
     assert (d["heights"][:HEAD_STEPS, ..., :4] == heights.UNKNOWN).all()
 
 
-def test_a_height_that_is_not_falling_with_level_fails_the_heights(tmp_path, capsys, monkeypatch):
+def test_an_unreadable_kept_head_is_dropped_and_its_hours_are_unknown(tmp_path, capfd):
+    steps = list(range(HEAD_STEPS))
+    assert _build(tmp_path, _hdeps(steps=steps), steps) == run_build.BUILT
+    d = tmp_path / "state" / run_build.HEIGHTS_SUB
+    old = d / f"{dwd.run_id(RUN)}.npz"
+    old.write_bytes(old.read_bytes()[:200])                       # cut short: not a zip any more
+    capfd.readouterr()
+    nxt = RUN + dt.timedelta(hours=6)
+    for out in ("out2", "out3"):                                  # ... and it does not fail the next run either
+        assert _build(tmp_path, _hdeps(run=nxt, steps=steps), steps, out=out) == run_build.BUILT
+        m = _manifest(tmp_path, out)
+        assert m["heights"]["steps"] == m["clues"]["steps"] and len(m["clues"]["steps"]) == 2 * HEAD_STEPS
+        got = heights.decode_height_square((tmp_path / out / "texdev" / m["heights"]["tiles"] / "N40W125.ich").read_bytes())
+        assert (got["heights"][:HEAD_STEPS, ..., :4] == heights.UNKNOWN).all()
+        assert (got["heights"][HEAD_STEPS:, ..., :4] != heights.UNKNOWN).all()
+        text = capfd.readouterr().out
+        assert ("::warning::heights: kept head" in text and old.name in text) == (out == "out2")
+    assert not old.exists()
+    assert [p.name for p in d.glob("*.npz")] == [f"{dwd.run_id(nxt)}.npz"]
+    with np.load(d / f"{dwd.run_id(nxt)}.npz") as z:
+        assert z["head"].shape[0] == HEAD_STEPS
+
+
+def test_a_height_that_is_not_falling_with_level_fails_the_heights(tmp_path, capfd, monkeypatch):
     # HHL files out of order (or not heights) must never be turned into bases and tops.
     steps = [0, 1]
     real = _agl
     monkeypatch.setitem(globals(), "_agl", lambda half: real(95) if half == 96 else real(half))
     assert _build(tmp_path, _hdeps(steps=steps), steps) == run_build.BUILT
-    assert "::warning::heights failed" in capsys.readouterr().out
+    assert "::warning::heights failed" in capfd.readouterr().out
     assert "heights" not in _manifest(tmp_path)
