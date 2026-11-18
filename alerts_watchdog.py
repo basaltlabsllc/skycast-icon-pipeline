@@ -46,7 +46,7 @@ KEY_ENV = "RESEND_ALERTS_KEY"
 HEALTH_TIMEOUT = 15
 SEND_TIMEOUT = 15
 FIELDS = ("ok", "lastRunAgeMin", "lastOkAgeMin", "lastErrorKind")
-USER_AGENT = "skycast-tick-watchdog (github.com/eriknugshots/skycast-icon-pipeline)"
+USER_AGENT = "skycast-tick-watchdog (github.com/basaltlabsllc/skycast-icon-pipeline)"
 
 START, OK, DOWN = "start", "ok", "down"
 
@@ -134,7 +134,7 @@ def compose(kind, cause, fields, now, down_since=None, name="alerts", health_url
               f"Health: {health_url}",
               f"Logs: {LOGS_URL}",
               "",
-              "Sent by the tick watchdog (eriknugshots/skycast-icon-pipeline, .github/workflows/tick.yml)."]
+              "Sent by the tick watchdog (basaltlabsllc/skycast-icon-pipeline, .github/workflows/tick.yml)."]
     return subject, "\n".join(lines) + "\n"
 
 

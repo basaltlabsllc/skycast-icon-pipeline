@@ -14,7 +14,7 @@
 set -euo pipefail
 case $- in *x*) echo "watchdog-key-setup: do not run with -x, it would print the keys" >&2; exit 1 ;; esac
 
-REPO="${REPO:-eriknugshots/skycast-icon-pipeline}"
+REPO="${REPO:-basaltlabsllc/skycast-icon-pipeline}"
 DOMAIN="skycastapp.com"
 SECRET="RESEND_ALERTS_KEY"
 FULL_KEY_FILE="${RESEND_FULL_KEY_FILE:-$HOME/.config/skycast/resend.key}"

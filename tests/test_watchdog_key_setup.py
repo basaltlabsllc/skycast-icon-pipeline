@@ -93,7 +93,7 @@ def test_it_creates_a_send_only_key_for_skycastapp_and_stores_it(tmp_path):
     assert body["permission"] == "sending_access" and body["domain_id"] == "dom_sky"
     assert body["name"].startswith("skycast-tick-watchdog ")
     gh = (tmp_path / "gh.log").read_text().splitlines()
-    assert gh[-1] == "secret set RESEND_ALERTS_KEY --repo eriknugshots/skycast-icon-pipeline"
+    assert gh[-1] == "secret set RESEND_ALERTS_KEY --repo basaltlabsllc/skycast-icon-pipeline"
     assert (tmp_path / "gh.stdin").read_text() == SEND_ONLY
     assert "key_new" in p.stdout and "RESEND_ALERTS_KEY" in p.stdout
 

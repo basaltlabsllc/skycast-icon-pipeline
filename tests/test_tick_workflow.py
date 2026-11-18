@@ -99,7 +99,7 @@ def run_loop(tmp_path, wd_mode, busy=()):
     script = tmp_path / "loop.sh"
     script.write_text(loop_script())
     env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "T": str(tmp_path), "WD_MODE": wd_mode,
-           "GITHUB_REPOSITORY": "eriknugshots/skycast-icon-pipeline", "RUNNER_TEMP": str(runner_temp)}
+           "GITHUB_REPOSITORY": "basaltlabsllc/skycast-icon-pipeline", "RUNNER_TEMP": str(runner_temp)}
     # GitHub runs `run:` steps as: bash --noprofile --norc -eo pipefail {0}
     p = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
                        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)

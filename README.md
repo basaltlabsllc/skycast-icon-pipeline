@@ -5,7 +5,7 @@ for SkyCast's "DWD ICON · Direct" forecast source.
 
 Data: Deutscher Wetterdienst (DWD), https://opendata.dwd.de, CC BY 4.0.
 
-Site: https://eriknugshots.github.io/skycast-icon-pipeline/ — `manifest.json`
+Site: https://basaltlabsllc.github.io/skycast-icon-pipeline/ — `manifest.json`
 plus `tiles/<run>/<square>.icl` (format: `pipeline/encode.py`).
 
 `tail/<run>/<square>.icl` holds hours 123–144 of the newest 00Z/12Z run, for SkyCast's days 4–5. Manifest key `tail`.
