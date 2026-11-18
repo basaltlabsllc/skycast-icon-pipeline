@@ -84,8 +84,8 @@ def _pack_matches(root, folder, pack_rel):
 # kinds each model writes: (manifest kind, folder)
 KINDS = {
     "gfs": ["tiles", "blocks", "tail", "thick", "wind"],
-    "aifs": ["tiles", "blocks", "tail"],
-    "ifs": ["tiles", "blocks", "tail", "thick"],
+    "aifs": ["tiles", "blocks", "tail", "wind"],
+    "ifs": ["tiles", "blocks", "tail", "thick", "wind"],
 }
 
 
