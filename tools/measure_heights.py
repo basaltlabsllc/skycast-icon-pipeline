@@ -2,9 +2,10 @@
 # tools/measure_heights.py — what CLOUD HEIGHTS per deck would cost the texture
 # feed, measured on REAL DWD data and not published: for every node and step
 # the texdev build covers, ICON's cloud cover on MODEL LEVELS (CLC) from the
-# ground to 5 km above it, with the half-level heights (HHL), turned into four
-# bytes — low-deck base, low-deck top, mid-deck base, mid-deck top, in 50 m
-# steps above sea level, 255 = no cloud level in that deck.
+# ground to 5 km above it, with the half-level heights (HHL), turned into the
+# feed's five bytes (pipeline/heights.py: low-deck base, low-deck top, mid-deck
+# base, mid-deck top in 50 m steps above sea level, and a flags byte). The
+# decks, the bytes and the packing are the feed's own, imported from there.
 #
 # It reports which files DWD lists and their size, the download and build
 # time (a timed sample, then every step with the texdev build's worker count),
@@ -17,7 +18,6 @@ import os
 import re
 import sys
 import time
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -27,26 +27,12 @@ sys.path.insert(0, str(ROOT))
 
 import run_build                                              # noqa: E402
 import texdev_build                                           # noqa: E402
-from pipeline import cluefile, clues, columns, dwd, history, regrid   # noqa: E402
-from pipeline.squares import DEG                              # noqa: E402
+from pipeline import columns, dwd, heights, history           # noqa: E402
+from pipeline.heights import (CLC_THRESHOLD_PCT, HEIGHT_STEP_M, NO_LEVEL, REACH_M, REACH_SHARE, UNKNOWN,   # noqa: E402
+                              choose_top_level, full_levels, reach_share)
 
-# ---- This MEASUREMENT's stand-ins (none of them is the feed's final rule) -----
-# A model level counts as cloud at this cover or more.
-CLC_THRESHOLD_PCT = 5.0
-# How far above the ground the levels are read.
-REACH_M = 5000.0
-# The level set must reach REACH_M at this share of the feed's nodes.
-REACH_SHARE = 0.99
-# STAND-IN deck split: pipeline/clues.py's DECK_BANDS_KM for low and mid, read
-# as metres above GROUND and capped at the reach. The final split will follow
-# DWD's own CLCL/CLCM boundary, which is not decided here. A level belongs to
-# the deck whose band holds its CENTRE (lower edge included, upper not).
-STANDIN_DECK_BANDS_M = {d: (clues.DECK_BANDS_KM[d][0] * 1000.0, min(clues.DECK_BANDS_KM[d][1] * 1000.0, REACH_M))
-                        for d in ("low", "mid")}
-# The byte: 50 m steps above sea level, 0..254 (12,700 m); 255 = no cloud level.
-HEIGHT_STEP_M = 50.0
-NO_LEVEL = 255
-N_HEIGHT_BYTES = 2 * len(STANDIN_DECK_BANDS_M)                # base, top per deck
+# The threshold, the reach, the decks (the model's own CLCL / CLCM levels), the
+# bytes and the packing are the feed's: pipeline/heights.py.
 # The sanity check's low cover: nodes where DWD's own CLCL is at least this.
 CLCL_CHECK_PCT = 20.0
 HISTORY_REPLAY = 60          # a texdev file carries 60 history hours; replay steps 0-59 to stand in
@@ -75,79 +61,6 @@ def listed_sizes(html):
 def listed_levels(html, field):
     """The levels a listing names for `field` (…_<level>_<FIELD>.grib2.bz2), ascending."""
     return sorted({int(lv) for lv in re.findall(rf'href="[^"]*_(\d+)_{field}\.grib2\.bz2"', html or "")})
-
-
-def reach_share(agl, reach_m):
-    """The share of nodes WITH a height where it is at least reach_m."""
-    agl = np.asarray(agl, dtype=float)
-    ok = np.isfinite(agl)
-    return float((agl[ok] >= reach_m).sum() / ok.sum()) if ok.any() else 0.0
-
-
-def choose_top_level(agl_by_half_level, reach_m, share):
-    """agl_by_half_level: {half level: heights above ground, m}; ICON counts
-    levels from the top, so the largest is the ground. The top half level of
-    the smallest set of lowest levels that is at least reach_m above ground
-    at `share` of the nodes — the first such going up — or None when none of
-    the given levels is. Full levels top..ground-1 then span ground to reach."""
-    ground = max(agl_by_half_level)
-    for lv in sorted((k for k in agl_by_half_level if k != ground), reverse=True):
-        if reach_share(agl_by_half_level[lv], reach_m) >= share:
-            return lv
-    return None
-
-
-def full_levels(top, ground):
-    """The full levels between half level `top` and the ground half level."""
-    return list(range(top, ground))
-
-
-def deck_bounds(clc, hhl, ground, threshold, bands_m):
-    """clc: [L][..] cover % on L full levels, the HIGHEST first (ICON's
-    order); hhl: [L+1][..] their half-level heights, m above sea level (level
-    i lies between hhl[i+1] and hhl[i]); ground: [..] m above sea level.
-    → float32 [2 x decks][..] in bands_m's order: each deck's base (the bottom
-    of its lowest level with cover >= threshold) and top (the top of its
-    highest), m above SEA level; NaN where the deck has no such level. A
-    level is in the deck whose band (m above ground, [lo, hi)) holds its
-    centre; a missing cover is not cloud."""
-    clc = np.asarray(clc, dtype=np.float32)
-    hhl = np.asarray(hhl, dtype=np.float32)
-    if hhl.shape[0] != clc.shape[0] + 1 or hhl.shape[1:] != clc.shape[1:]:
-        raise ValueError(f"{clc.shape[0]} levels need {clc.shape[0] + 1} half levels of the same nodes, "
-                         f"got clc {clc.shape}, hhl {hhl.shape}")
-    centre = (hhl[:-1] + hhl[1:]) / 2 - np.asarray(ground, dtype=np.float32)
-    with np.errstate(invalid="ignore"):
-        cloudy = clc >= threshold                        # NaN compares False
-        res = []
-        for lo, hi in bands_m.values():
-            m = cloudy & (centre >= lo) & (centre < hi)
-            base = np.where(m, hhl[1:], np.inf).min(axis=0)
-            top = np.where(m, hhl[:-1], -np.inf).max(axis=0)
-            none = ~m.any(axis=0)
-            res += [np.where(none, np.nan, base), np.where(none, np.nan, top)]
-    return np.stack(res).astype(np.float32)
-
-
-def height_bytes(metres):
-    """Heights in m above sea level → u8: floor(m / 50 + 0.5) clamped to
-    0..254 (half UP, as pipeline/clues.py rounds); NaN → 255."""
-    m = np.asarray(metres, dtype=np.float64)
-    ok = np.isfinite(m)
-    b = np.clip(np.floor(np.where(ok, m, 0.0) / HEIGHT_STEP_M + 0.5), 0, NO_LEVEL - 1)
-    return np.where(ok, b, NO_LEVEL).astype(np.uint8)
-
-
-def pack_square(cube):
-    """u8 [steps][rows][cols][4] → the zlib stream a clue file would carry it
-    as (pipeline/cluefile.py: node by node, each node's steps in time order,
-    each step's bytes; the same zlib level)."""
-    cube = np.asarray(cube)
-    if cube.dtype != np.uint8:
-        raise ValueError(f"heights must be uint8, got {cube.dtype}")
-    if cube.ndim != 4 or cube.shape[3] != N_HEIGHT_BYTES:
-        raise ValueError(f"heights must be [steps][rows][cols][{N_HEIGHT_BYTES}], got {cube.shape}")
-    return zlib.compress(np.ascontiguousarray(np.moveaxis(cube, 0, 2)).tobytes(), cluefile.ZLIB_LEVEL)
 
 
 # ---- The measurement ---------------------------------------------------------------
@@ -197,10 +110,8 @@ def main():
     n_side = columns.side(stride)
     out(f"squares: the {len(names)} of texdev_build.TEXDEV_SQUARES (all of them priced), 5° each, "
         f"{n_side} × {n_side} nodes at {columns.spacing_deg(stride)}° (run_build.UPPER_STRIDE = {stride})", summary)
-    out(f"STAND-INS for this measurement only: cloud = CLC >= {CLC_THRESHOLD_PCT:g} %; decks by the level centre's "
-        f"height above GROUND, " + ", ".join(f"{d} {lo:g}-{hi:g} m" for d, (lo, hi) in STANDIN_DECK_BANDS_M.items())
-        + " (pipeline/clues.py DECK_BANDS_KM capped at the 5 km reach). The final split will follow DWD's own "
-        "CLCL/CLCM boundary, not decided here.", summary)
+    out(f"the feed's rule (pipeline/heights.py): cloud = CLC >= {CLC_THRESHOLD_PCT:g} %; decks = the levels ICON "
+        f"itself counts into CLCL and CLCM (its 800 and 400 hPa reference-pressure levels, from HHL)", summary)
 
     # The nodes the feed holds: the squares' window of the lattice, and which of its points are a square's.
     window = run_build.square_window(names, stride)
@@ -297,11 +208,13 @@ def main():
         return run_build._crop(run_build._only(run_build._fetch_levels(deps, kit, work, [name], run, "CLC", stride)),
                                window)
 
+    masks = heights.deck_masks(hhl_stack)
+
     def to_bytes(clc):
-        return height_bytes(deck_bounds(clc, hhl_stack, ground, CLC_THRESHOLD_PCT, STANDIN_DECK_BANDS_M))
+        return heights.height_record(clc, hhl_stack, CLC_THRESHOLD_PCT, masks)
 
     base_hour = history.hour_of(run)
-    done = {}                                        # step -> u8 [4][R][C]
+    done = {}                                        # step -> u8 [5][R][C]
 
     # The sample: one file after another, so download and build time are wall time.
     sample = steps[:max(0, a.sample)]
@@ -377,9 +290,9 @@ def main():
     own = [(base_hour + s, done[s]) for s in steps]
     replay = [(base_hour - HISTORY_REPLAY + i, own[i][1]) for i in range(min(HISTORY_REPLAY, len(own)))]
     local = {name: run_build._local_nodes(name, stride, window) for name in names}
-    out(f"### Bytes added per square ({len(names)} squares, {N_HEIGHT_BYTES} bytes a node a step, zlib level "
-        f"{cluefile.ZLIB_LEVEL}, packed as pipeline/cluefile.py packs the clue bytes; the stream only: carried as "
-        f"its own file it would add an {cluefile._HEADER.size}-byte header + 4 bytes a step)", summary)
+    out(f"### Bytes per square ({len(names)} squares, {heights.N_BYTES} bytes a node a step, zlib level "
+        f"{heights.ZLIB_LEVEL}, the ICH1 file's stream (pipeline/heights.py); the file adds an "
+        f"{heights._HEADER.size}-byte header + 4 bytes a step)", summary)
     out("| steps | raw KB per square | compressed KB per square min / median / max | all squares MB | zlib s |\n"
         "|---|---|---|---|---|", summary)
     rows = []
@@ -389,10 +302,10 @@ def main():
         sizes = []
         for name in names:
             rr, cc = local[name]
-            cube = np.stack([b[:, rr][:, :, cc] for _, b in stacks])          # [steps][4][side][side]
-            sizes.append(len(pack_square(np.ascontiguousarray(np.moveaxis(cube, 1, 3)))))
+            cube = np.stack([b[:, rr][:, :, cc] for _, b in stacks])          # [steps][5][side][side]
+            sizes.append(len(heights.pack_square(np.ascontiguousarray(np.moveaxis(cube, 1, 3)))))
         z_s = time.monotonic() - t0
-        raw = len(stacks) * n_side * n_side * N_HEIGHT_BYTES
+        raw = len(stacks) * n_side * n_side * heights.N_BYTES
         srt = sorted(sizes)
         rows.append((len(stacks), sum(sizes)))
         out(f"| {len(stacks)} ({label}) | {raw / 1e3:.1f} | {srt[0] / 1e3:.1f} / {srt[len(srt) // 2] / 1e3:.1f} / "
@@ -403,9 +316,15 @@ def main():
         out(f"EXTRAPOLATED (by steps; only {len(steps)} of the feed's {n_feed} steps were built): {want} steps ≈ "
             f"{total / n * want / 1e6:.2f} MB for all squares", summary)
     allb = np.stack([b for _, b in own])[:, :, in_feed]
-    none = (allb == NO_LEVEL).mean(axis=(0, 2))
+    labels = ("low base", "low top", "mid base", "mid top")
+    none = (allb[:, :heights.N_HEIGHT_BYTES] == NO_LEVEL).mean(axis=(0, 2))
     out("share of node-steps with no level in the deck (byte 255): "
-        + ", ".join(f"{k} {v:.1%}" for k, v in zip(("low base", "low top", "mid base", "mid top"), none)), summary)
+        + ", ".join(f"{k} {v:.1%}" for k, v in zip(labels, none)), summary)
+    unread = (allb[:, :heights.N_HEIGHT_BYTES] == UNKNOWN).mean(axis=(0, 2))
+    out(f"share not read (byte {UNKNOWN}: a level's cover or a height missing): "
+        + ", ".join(f"{k} {v:.3%}" for k, v in zip(labels, unread)), summary)
+    out(f"share of node-steps whose mid top is the top of the highest level read (flag bit "
+        f"{heights.FLAG_TOP_AT_REACH}): {(allb[:, heights.FLAGS] & heights.FLAG_TOP_AT_REACH > 0).mean():.2%}", summary)
 
     # ---- Sanity ---------------------------------------------------------------------
     out("### Sanity check", summary)
@@ -415,8 +334,8 @@ def main():
         else:
             out(f"step {s}: of {n_low} nodes with DWD's single-level CLCL >= {CLCL_CHECK_PCT:g} %, "
                 f"{n_both} ({n_both / max(n_low, 1):.1%}) got a low-deck base; {n_base} nodes got one in all "
-                f"(CLCL is DWD's pressure-bounded low cloud; the stand-in low deck starts "
-                f"{STANDIN_DECK_BANDS_M['low'][0]:g} m above ground, so they are not expected to match)", summary)
+                f"(the low deck is CLCL's own levels, so a miss is cover under {CLC_THRESHOLD_PCT:g} % on every "
+                f"level, or the lattice's blend of neighbouring cells)", summary)
     if not clcl_hit:
         out("CLCL check skipped: no sample step", summary)
     sp = columns.spacing_deg(stride)
@@ -440,9 +359,11 @@ def main():
         if not shown:
             out("  (none)", summary)
         b = done[s][:, br, bc]
-        for k, label in enumerate(("low base", "low top", "mid base", "mid top")):
+        for k, label in enumerate(labels):
             if b[k] == NO_LEVEL:
                 out(f"  {label}: byte 255 = no cloud level in that deck", summary)
+            elif b[k] == UNKNOWN:
+                out(f"  {label}: byte {UNKNOWN} = not read", summary)
             else:
                 m = b[k] * HEIGHT_STEP_M
                 out(f"  {label}: byte {b[k]} = {m:.0f} m above sea level = {(m - g) * FT:.0f} ft above ground", summary)
