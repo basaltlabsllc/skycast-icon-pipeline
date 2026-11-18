@@ -282,7 +282,7 @@ def _gfs_msg(kind, lev, vals):
     return b
 
 
-def _gfs_fixture(u_of, tcdc_of, ps_pa, levels=(1000, 850, 700, 600, 500, 300, 250, 150)):
+def _gfs_fixture(u_of, tcdc_of, ps_pa, levels=GFS_LEVELS):
     """A GFS file with the 2 x 2 fields below, in idx order, and a get() serving it."""
     rows, buf, parts = [], b"", []
     for lev in levels:
@@ -304,7 +304,7 @@ def _gfs_fixture(u_of, tcdc_of, ps_pa, levels=(1000, 850, 700, 600, 500, 300, 25
 
 def test_gfs_read_wind_step_returns_deck_layer_winds():
     from pipeline import layerwind
-    levels = (1000, 850, 700, 600, 500, 300, 250, 150)
+    levels = GFS_LEVELS
     u_of = lambda lev: lev / 10.0
     cloudy = {700, 600}                        # one cloudy run, in the low and mid decks
     get = _gfs_fixture(u_of, lambda lev: 80.0 if lev in cloudy else 1.0, [101300.0, 101300.0, 60000.0, 60000.0])
@@ -334,3 +334,61 @@ def test_gfs_read_wind_step_rejects_swapped_message():
            .replace("@:850 mb", "VGRD:850 mb"))                              # the idx swaps 850 mb u and v
     with pytest.raises(ValueError, match="expected . 850"):
         grib.read_wind_step(GFS, RUN, 6, lambda u, r=None: idx.encode() if u.endswith(".idx") else get(u, r))
+
+
+def test_gfs_level_missing_its_ugrd_row_raises_keyerror():
+    # the level list is fixed: a level lacking only UGRD must fail, not drop out
+    with pytest.raises(KeyError, match="UGRD"):
+        grib.wind_ranges(GFS, _ncep_idx(skip=(("UGRD", "700 mb"),)), 6)
+    assert grib.GFS_WIND_LEVELS == GFS_LEVELS
+
+
+def test_ecmwf_wind_fields_stay_float64_and_unchanged():
+    get, order = _ifs_order_fixture()
+    out = grib.read_wind_step(IFS, RUN, 6, get)
+    for i, (lev, c) in enumerate(order):
+        a = out[(lev, c)]
+        assert a.dtype == np.float64 and a.shape == (2, 2)
+        assert (a == float(10 * (i + 1))).all()
+    # the same values the reader's own decode (eccodes + isclose-missing mask) gives, uncast
+    import eccodes
+    raw = _wind_msg("u", 850, 12.3456789)
+    g = eccodes.codes_new_from_message(raw)
+    want = np.where(np.isclose(eccodes.codes_get_values(g), eccodes.codes_get(g, "missingValue")), np.nan,
+                    eccodes.codes_get_values(g))
+    eccodes.codes_release(g)
+    assert want.dtype == np.float64
+
+
+def _swap_get(get, idx_edit):
+    def g(url, rng=None):
+        return idx_edit(get(url, rng).decode()).encode() if url.endswith(".idx") else get(url, rng)
+    return g
+
+
+def test_gfs_wind_message_in_a_tcdc_slot_is_rejected():
+    get = _gfs_fixture(lambda lev: 1.0, lambda lev: 1.0, [101300.0] * 4)
+    tcdc, wind_u = _gfs_msg("tcdc", 850, [1.0] * 4), _gfs_msg("u", 850, [7.0] * 4)
+    assert len(tcdc) == len(wind_u)                  # same size: offsets in the idx stay true
+
+    def g(url, rng=None):
+        b = get(url, rng)
+        return b if url.endswith(".idx") else b.replace(tcdc, wind_u)   # a UGRD message in the TCDC 850 slot
+    with pytest.raises(ValueError, match="expected tcdc 850"):
+        grib.read_wind_step(GFS, RUN, 6, g)
+
+
+def test_gfs_pres_that_is_not_the_surface_is_rejected():
+    import eccodes
+    get = _gfs_fixture(lambda lev: 1.0, lambda lev: 1.0, [101300.0] * 4)
+    base_msg = _gfs_msg("pres", 0, [101300.0] * 4)
+    h = eccodes.codes_new_from_message(base_msg)
+    eccodes.codes_set(h, "typeOfFirstFixedSurface", 6)          # max wind: shortName pres, level 0, like the surface
+    bad = eccodes.codes_get_message(h); eccodes.codes_release(h)
+    assert len(bad) == len(base_msg)
+
+    def g(url, rng=None):
+        b = get(url, rng)
+        return b if url.endswith(".idx") else b.replace(base_msg, bad)   # ranges merge touching messages
+    with pytest.raises(ValueError, match="surface pressure"):
+        grib.read_wind_step(GFS, RUN, 6, g)

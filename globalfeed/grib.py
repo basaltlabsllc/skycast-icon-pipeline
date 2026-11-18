@@ -223,7 +223,11 @@ def read_column_thick(model, run, fh, get):
 # wind over the model's own cloud layer per deck (pipeline.layerwind), built from
 # UGRD / VGRD / TCDC at every isobaric level 1000-150 mb and the surface pressure.
 
-GFS_WIND_TOP, GFS_WIND_BOTTOM = 150, 1000
+# GFS's isobaric levels 1000-150 hPa (all present in the 0.25 degree idx at f000 and
+# f120, checked 2026-11-18). A missing row at any of them fails the step: a level
+# that quietly dropped out would shift every weight in its deck.
+GFS_WIND_LEVELS = (1000, 975, 950, 925, 900, 850, 800, 750, 700, 650,
+                   600, 550, 500, 450, 400, 350, 300, 250, 200, 150)
 
 
 def _ncep_wind_ranges(index_text, fh):
@@ -237,13 +241,8 @@ def _ncep_wind_ranges(index_text, fh):
             raise KeyError(f"{name} ({level}, {want}) not in idx")
         return int(rows[k][1]), int(rows[k + 1][1]) - 1 if k + 1 < len(rows) else None
 
-    levs = sorted({int(r[4][:-3]) for r in rows
-                   if len(r) > 5 and r[3] == "UGRD" and r[5] == want and r[4].endswith(" mb")
-                   and r[4][:-3].isdigit() and GFS_WIND_TOP <= int(r[4][:-3]) <= GFS_WIND_BOTTOM})
-    if not levs:
-        raise KeyError(f"UGRD (isobaric levels, {want}) not in idx")
     out = {}
-    for lev in levs:
+    for lev in GFS_WIND_LEVELS:
         for comp, name in (("u", "UGRD"), ("v", "VGRD"), ("tcdc", "TCDC")):
             out[(lev, comp)] = find(name, f"{lev} mb")
     out[("sfc", "pres")] = find("PRES", "surface")
@@ -253,8 +252,7 @@ def _ncep_wind_ranges(index_text, fh):
 def wind_ranges(model, index_text, fh):
     """{key: (start, end)} for the wind messages of one forecast hour; end is
     inclusive or None for the file's last message. NCEP (GFS): keys
-    (level hPa, 'u'|'v'|'tcdc') for every isobaric level 1000-150 mb the index
-    lists UGRD at, plus ('sfc', 'pres'); rows picked by exact name, level and
+    (level hPa, 'u'|'v'|'tcdc') for each of GFS_WIND_LEVELS, plus ('sfc', 'pres'); rows picked by exact name, level and
     forecast text ("anl" at f000). ECMWF: (level, 'u'|'v') at 850 / 500 / 250,
     rows by param u / v, levtype pl and levelist. KeyError if a row is missing."""
     if model.index_kind == "ncep":
@@ -276,12 +274,15 @@ def _check_message(g, want_lev, want_comp):
     level = int(round(float(eccodes.codes_get(g, "level"))))
     short = str(eccodes.codes_get(g, "shortName"))
     if want_lev == "sfc":
-        if short not in ("sp", "pres") or level != 0:
+        # PRES also exists at the tropopause, max wind and cloud base/top, all level 0
+        if short not in ("sp", "pres") or level != 0 or str(eccodes.codes_get(g, "typeOfLevel")) != "surface":
             raise ValueError(f"wind: expected surface pressure, message is {short} {level}")
     elif want_comp == "tcdc":
-        # the shortName of a pressure-level cloud cover is not stable across ecCodes tables
-        if level != want_lev:
-            raise ValueError(f"wind: expected tcdc {want_lev} hPa, message is {short} {level}")
+        # the shortName of a pressure-level cloud cover is not stable across ecCodes
+        # tables: check the GRIB2 parameter (discipline 0, category 6, number 1) instead
+        triple = tuple(int(eccodes.codes_get(g, k)) for k in ("discipline", "parameterCategory", "parameterNumber"))
+        if level != want_lev or triple != (0, 6, 1):
+            raise ValueError(f"wind: expected tcdc {want_lev} hPa, message is {short} {level} {triple}")
     elif (short, level) != (want_comp, want_lev):
         raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {short} {level}")
 
@@ -324,7 +325,9 @@ def read_wind_fields(model, run, fh, get):
                 miss = eccodes.codes_get(g, "missingValue")
             finally:
                 eccodes.codes_release(g)
-            out[keys[pos]] = np.where(np.isclose(vals, miss), np.nan, vals).astype(np.float32)
+            vals = np.where(np.isclose(vals, miss), np.nan, vals)
+            # GFS fields are cast to float32 to hold 61 per step; ECMWF stays float64 as before
+            out[keys[pos]] = vals.astype(np.float32) if model.index_kind == "ncep" else vals
     return out
 
 
