@@ -94,6 +94,8 @@ def test_write_wind_skips_empty_groups(tmp_path):
     assert wind.manifest_entry(run) == {"format": "ICW1", "run": "2026-11-17T00Z",
                                         "runMs": int(run.timestamp() * 1000),
                                         "tiles": "wind/2026111700", "levels": [850, 500, 250]}
+    assert wind.manifest_entry(run, "cloud") == {**wind.manifest_entry(run), "layer": "cloud"}
+    assert "layer" not in wind.manifest_entry(run, None)
 
 
 def test_group_cube_quantisation():
@@ -103,3 +105,9 @@ def test_group_cube_quantisation():
     lt = {(lev, c): base for lev in wind.LEVELS for c in "uv"}
     cube = wind.group_cube([lt], "S10E000")
     assert cube[0, 0, 0, 10, :5].tolist() == [0, 1, 127, -127, wind.MISSING]
+
+
+def test_manifest_entry_layer():
+    run = dt.datetime(2026, 11, 17, 0, tzinfo=dt.timezone.utc)
+    assert "layer" not in wind.manifest_entry(run)
+    assert wind.manifest_entry(run, layer="cloud")["layer"] == "cloud"

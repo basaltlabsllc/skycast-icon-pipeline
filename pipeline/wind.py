@@ -173,6 +173,12 @@ def write_wind(out_dir, run, step_hours, lattices_per_step, names=None):
     return total
 
 
-def manifest_entry(run):
-    return {"format": "ICW1", "run": run_iso(run), "runMs": int(run.timestamp() * 1000),
-            "tiles": wind_path(run), "levels": list(LEVELS)}
+def manifest_entry(run, layer=None):
+    """The manifest's `wind` entry. `layer` (e.g. "cloud") says the three decks
+    hold the wind over the model's cloud layer, not the 850/500/250 hPa wind;
+    left out when None."""
+    e = {"format": "ICW1", "run": run_iso(run), "runMs": int(run.timestamp() * 1000),
+         "tiles": wind_path(run), "levels": list(LEVELS)}
+    if layer is not None:
+        e["layer"] = layer
+    return e

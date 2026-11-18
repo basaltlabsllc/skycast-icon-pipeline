@@ -6,7 +6,7 @@ import json
 import numpy as np
 import eccodes
 
-from pipeline import wind
+from pipeline import layerwind, wind
 
 G = 9.80665
 _MASS = (("ICMR", "ice"), ("CLMR", "water"))
@@ -218,27 +218,46 @@ def read_column_thick(model, run, fh, get):
 
 
 # ---- Wind (ICW1) --------------------------------------------------------------
-# u and v at 850, 500 and 250 hPa (pipeline.wind.LEVELS), m/s, on the source grid.
+# u and v for the three decks (ICW1 keys 850 / 500 / 250 = low / mid / high, see
+# pipeline.wind.LEVELS). AIFS / IFS: the wind at those pressure levels. GFS: the
+# wind over the model's own cloud layer per deck (pipeline.layerwind), built from
+# UGRD / VGRD / TCDC at every isobaric level 1000-150 mb and the surface pressure.
+
+# GFS's isobaric levels 1000-150 hPa (all present in the 0.25 degree idx at f000 and
+# f120, checked 2026-11-18). A missing row at any of them fails the step: a level
+# that quietly dropped out would shift every weight in its deck.
+GFS_WIND_LEVELS = (1000, 975, 950, 925, 900, 850, 800, 750, 700, 650,
+                   600, 550, 500, 450, 400, 350, 300, 250, 200, 150)
+
+
+def _ncep_wind_ranges(index_text, fh):
+    want = "anl" if fh == 0 else f"{fh} hour fcst"
+    rows = [ln.split(":") for ln in index_text.strip().split("\n") if ln.strip()]
+
+    def find(name, level):
+        k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
+                  and r[4] == level and r[5] == want), None)
+        if k is None:
+            raise KeyError(f"{name} ({level}, {want}) not in idx")
+        return int(rows[k][1]), int(rows[k + 1][1]) - 1 if k + 1 < len(rows) else None
+
+    out = {}
+    for lev in GFS_WIND_LEVELS:
+        for comp, name in (("u", "UGRD"), ("v", "VGRD"), ("tcdc", "TCDC")):
+            out[(lev, comp)] = find(name, f"{lev} mb")
+    out[("sfc", "pres")] = find("PRES", "surface")
+    return out
+
 
 def wind_ranges(model, index_text, fh):
-    """{(level, 'u'|'v'): (start, end)} for the six wind messages of one forecast
-    hour; end is inclusive or None for the file's last message. NCEP rows are
-    picked by exact name (UGRD / VGRD), "<lev> mb" and forecast text ("anl" at
-    f000); ECMWF rows by param u / v, levtype pl and levelist. KeyError if a
-    row is missing."""
-    out = {}
+    """{key: (start, end)} for the wind messages of one forecast hour; end is
+    inclusive or None for the file's last message. NCEP (GFS): keys
+    (level hPa, 'u'|'v'|'tcdc') for each of GFS_WIND_LEVELS, plus ('sfc', 'pres'); rows picked by exact name, level and
+    forecast text ("anl" at f000). ECMWF: (level, 'u'|'v') at 850 / 500 / 250,
+    rows by param u / v, levtype pl and levelist. KeyError if a row is missing."""
     if model.index_kind == "ncep":
-        want = "anl" if fh == 0 else f"{fh} hour fcst"
-        rows = [ln.split(":") for ln in index_text.strip().split("\n") if ln.strip()]
-        for lev in wind.LEVELS:
-            for comp, name in (("u", "UGRD"), ("v", "VGRD")):
-                k = next((i for i, r in enumerate(rows) if len(r) > 5 and r[3] == name
-                          and r[4] == f"{lev} mb" and r[5] == want), None)
-                if k is None:
-                    raise KeyError(f"{name} ({lev} mb, {want}) not in idx")
-                start = int(rows[k][1])
-                out[(lev, comp)] = (start, int(rows[k + 1][1]) - 1 if k + 1 < len(rows) else None)
-        return out
+        return _ncep_wind_ranges(index_text, fh)
+    out = {}
     rows = [json.loads(ln) for ln in index_text.strip().split("\n") if ln.strip()]
     for lev in wind.LEVELS:
         for comp in "uv":
@@ -250,10 +269,40 @@ def wind_ranges(model, index_text, fh):
     return out
 
 
+def _check_message(g, want_lev, want_comp):
+    """The index said which message this is; the bytes must agree."""
+    level = int(round(float(eccodes.codes_get(g, "level"))))
+    short = str(eccodes.codes_get(g, "shortName"))
+    if want_lev == "sfc":
+        # PRES also exists at the tropopause, max wind and cloud base/top, all level 0
+        if short not in ("sp", "pres") or level != 0 or str(eccodes.codes_get(g, "typeOfLevel")) != "surface":
+            raise ValueError(f"wind: expected surface pressure, message is {short} {level}")
+    elif want_comp == "tcdc":
+        # the shortName of a pressure-level cloud cover is not stable across ecCodes
+        # tables: check the GRIB2 parameter (discipline 0, category 6, number 1) instead
+        triple = tuple(int(eccodes.codes_get(g, k)) for k in ("discipline", "parameterCategory", "parameterNumber"))
+        if level != want_lev or triple != (0, 6, 1):
+            raise ValueError(f"wind: expected tcdc {want_lev} hPa, message is {short} {level} {triple}")
+    elif (short, level) != (want_comp, want_lev):
+        raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {short} {level}")
+
+
 def read_wind_step(model, run, fh, get):
-    """The six wind fields of one forecast hour: {"lat": 1-D, "lon": 1-D (-180..180),
-    (level, 'u'|'v'): float [nlat][nlon] m/s}, the source's regular grid. get(url, rng=None) -> bytes is
-    injected; messages whose rows touch are fetched as one range."""
+    """The wind of one forecast hour: {"lat": 1-D, "lon": 1-D (-180..180),
+    (key, 'u'|'v'): float [nlat][nlon] m/s}, the source's regular grid. get(url,
+    rng=None) -> bytes is injected; messages whose rows touch are fetched as one
+    range. GFS reads every level and returns the three decks' cloud-layer winds
+    under keys 850 / 500 / 250 (low / mid / high); others return the six
+    pressure-level fields as published."""
+    out = read_wind_fields(model, run, fh, get)
+    if model.index_kind != "ncep":
+        return out
+    return gfs_deck_winds(out)
+
+
+def read_wind_fields(model, run, fh, get):
+    """The messages wind_ranges asks for, decoded as {"lat", "lon", key: float32
+    [nlat][nlon]} (NaN where missing), each checked against its idx row."""
     ranges = wind_ranges(model, get(model.index_url(run, fh)).decode(), fh)
     keys = list(ranges)
     url = model.url(run, fh)
@@ -271,14 +320,30 @@ def read_wind_step(model, run, fh, get):
                     lon = eccodes.codes_get_array(g, "longitudes").reshape(nj, ni)
                     out["lat"] = lat[:, 0]
                     out["lon"] = np.where(lon[0] > 180, lon[0] - 360, lon[0])
-                # the index said which message this is; the bytes must agree
-                want_lev, want_comp = keys[pos]
-                got = (str(eccodes.codes_get(g, "shortName")), int(round(float(eccodes.codes_get(g, "level")))))
-                if got != (want_comp, want_lev):
-                    raise ValueError(f"wind: expected {want_comp} {want_lev} hPa, message is {got[0]} {got[1]}")
+                _check_message(g, *keys[pos])
                 vals = eccodes.codes_get_values(g).reshape(nj, ni)
                 miss = eccodes.codes_get(g, "missingValue")
             finally:
                 eccodes.codes_release(g)
-            out[keys[pos]] = np.where(np.isclose(vals, miss), np.nan, vals)
+            vals = np.where(np.isclose(vals, miss), np.nan, vals)
+            # GFS fields are cast to float32 to hold 61 per step; ECMWF stays float64 as before
+            out[keys[pos]] = vals.astype(np.float32) if model.index_kind == "ncep" else vals
+    return out
+
+
+def gfs_deck_winds(fields):
+    """read_wind_fields' GFS result -> {"lat", "lon", (850|500|250, 'u'|'v'): float32
+    [nlat][nlon]}: each deck's wind over its cloud layer (pipeline.layerwind)."""
+    out = {"lat": fields["lat"], "lon": fields["lon"]}
+    levels = sorted({k[0] for k in fields if isinstance(k, tuple) and k[0] != "sfc"}, reverse=True)
+    ps = fields[("sfc", "pres")]
+    shape = ps.shape
+    flat = lambda a: a.reshape(-1)
+    ps_hpa = flat(ps).astype(np.float64) / 100.0
+    u = [flat(fields[(lev, "u")]) for lev in levels]
+    v = [flat(fields[(lev, "v")]) for lev in levels]
+    cloudy = [flat(fields[(lev, "tcdc")]) >= layerwind.TCDC_CLOUDY for lev in levels]   # NaN is never cloudy
+    decks = layerwind.deck_winds(levels, u, v, cloudy, ps_hpa, layerwind.deck_bounds("ncep", ps_hpa))
+    for k, a in decks.items():
+        out[k] = a.reshape(shape)
     return out
