@@ -51,8 +51,20 @@ export const isProtected = (p) => PROTECTED_PREFIXES.some((k) => p.startsWith(k)
 // begun within keepHours of the current one, its clouds and thickness folders
 // (RUN_KEEP_FAMILIES) and that file. The app's server fill (SkyCast
 // src/reportfill.js regionalRunAtShot) reads the run that was live at a shot
-// from them. Fog folders are NOT kept (HRRR's are ~500 MB a run).
+// from them. Fog folders are NOT kept whole (HRRR's are ~580 MB a run), but
+// see FOG HISTORY below.
 export const RUN_KEEP_FAMILIES = ['tiles', 'thick'];
+
+// FOG HISTORY (Erik 2026-11-19: fog in Bend that night was gone when he
+// scrubbed back to it the next morning: the hours before the live run were
+// ICON's, which has no visibility). With keepHours set, every run begun within
+// FOG_KEEP_HOURS of the current one keeps its fog pack's first block
+// (fog/<run>/pack/0.iccp, the run's first blockHours steps, ~185 MB) and the
+// pack's index.json; the run file (above) names them. SkyCast reads each past
+// hour from the run begun at that hour (src/hrrrfog.js fetchHrrrFogPast).
+// No new uploads: those files are only left undeleted.
+export const FOG_KEEP_HOURS = 24;
+const FOG_KEPT_FILES = ['index.json', '0.iccp'];
 const HOUR_MS = 3600000;
 
 /** '2026111619' for 2026-11-16T19Z (a run folder's name). */
@@ -69,12 +81,19 @@ export function runIdMs(id) {
   return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4]) : NaN;
 }
 
-/** Is this path a kept run's clouds, thickness or run file (begun at or after sinceMs)? */
-export function keptRunPath(p, sinceMs) {
+/** Is this path a kept run's clouds, thickness or run file (begun at or after
+ *  sinceMs), or a kept run's first fog block or its pack index (begun at or
+ *  after fogSinceMs: FOG HISTORY)? */
+export function keptRunPath(p, sinceMs, fogSinceMs = Infinity) {
   const file = /^runs\/(\d{10})\.json$/.exec(p);
   if (file) return runIdMs(file[1]) >= sinceMs;
   const r = runFolder(p);
-  return !!r && RUN_KEEP_FAMILIES.includes(r.family) && runIdMs(r.run) >= sinceMs;
+  if (!r) return false;
+  if (r.family === 'fog') {
+    const rest = p.slice(`fog/${r.run}/`.length);
+    return FOG_KEPT_FILES.some((f) => rest === `pack/${f}`) && runIdMs(r.run) >= fogSinceMs;
+  }
+  return RUN_KEEP_FAMILIES.includes(r.family) && runIdMs(r.run) >= sinceMs;
 }
 
 /**
@@ -83,8 +102,10 @@ export function keptRunPath(p, sinceMs) {
  */
 export function pathsToDelete(pathnames, { current, previous, keepHours = 0 }) {
   const keep = [...manifestFolders(current), ...manifestFolders(previous)];
-  const sinceMs = keepHours > 0 && current && Number.isFinite(current.runMs) ? current.runMs - keepHours * HOUR_MS : Infinity;
-  return pathnames.filter((p) => p !== 'manifest.json' && !isProtected(p) && !keep.some((k) => p.startsWith(k)) && !keptRunPath(p, sinceMs));
+  const on = keepHours > 0 && current && Number.isFinite(current.runMs);
+  const sinceMs = on ? current.runMs - keepHours * HOUR_MS : Infinity;
+  const fogSinceMs = on ? current.runMs - Math.min(keepHours, FOG_KEEP_HOURS) * HOUR_MS : Infinity;
+  return pathnames.filter((p) => p !== 'manifest.json' && !isProtected(p) && !keep.some((k) => p.startsWith(k)) && !keptRunPath(p, sinceMs, fogSinceMs));
 }
 
 // The one-off backlog cleanup (prune-backlog.mjs). From Nov 1 every publish's
