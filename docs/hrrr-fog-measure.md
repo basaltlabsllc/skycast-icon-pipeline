@@ -71,3 +71,30 @@ from the south-west first point. Longitudes come back in 0..360 (not wrapped to 
 | 0, 0 | 0 | 21.138123 | 237.280472 |
 | 900, 530 | 954370 | 38.524222 | 262.528505 |
 | 1798, 1058 | 1905140 | 47.842195 | 299.082807 |
+
+## CLMR per level and surface VIS (2026-11-18)
+
+The fog tiles gain 9 dynamic fields before static HSURF: CLMR (kg/kg, scale 1e-7, kind 12) at 1000, 975, 950, 925, 900, 850,
+800, 700 hPa, then VIS (m, scale 1, kind 13, level type 2). 27 fields become 36.
+
+Measured on the same HRRR run (2026-11-19 00Z, 4 steps, the four Bend tiles) with `tools/hrrr_fog_measure.py 4`: old = the
+tool as on origin/main (85ee1c7), new = the tool on branch `fog-clmr-vis` (its `wanted()` now lists the 9 new fields). The
+new run used curl for range reads through a scratch wrapper because the tool's urllib `get()` hit repeated short reads
+through the sandbox proxy; the encoding path is the tool's own.
+
+| | old (27 fields) | new (36 fields) |
+|---|---|---|
+| N43W122 | 55037 B | 68775 B |
+| N44W122 | 63322 B | 80466 B |
+| N43W121 | 18244 B | 21978 B |
+| N44W121 | 21143 B | 26523 B |
+| mean per tile, 4 steps | 39436 B | 49436 B (+25.4 %) |
+| B = 6 h, kB per tile | 59.2 | 74.2 |
+| one-day place, B = 6 h (9 tiles x 5 blocks) | 2.66 MB | 3.34 MB |
+
+Blob puts per run do not change: one file per tile and block plus one pack per block, whatever the field count. Checked with
+`build_fog` on the fake grid from `tests/test_hrrr_fogtiles.py`, 12 steps: 9 files at 27 fields (42098 B) and 9 files at 36
+fields (68944 B; the fake's fields are synthetic, so only the file count is meaningful there).
+
+The Bend sample is mountain-biased low on the eastern tiles, so a lowland place costs more than these means. The +25 % is
+the cost to weigh against the 2.5 MB one-day figure the Decision above accepted at 2.57 MB.

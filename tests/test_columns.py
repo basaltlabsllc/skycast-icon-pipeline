@@ -179,9 +179,26 @@ def test_encode_columns_grid_matches_encode_columns():
         columns.encode_columns_grid(40, -125, 250, 21, [7, 9], spec, dyn, sta)
 
 
+def test_field_spec_hrrr_clmr_vis_last_dynamic():
+    spec = columns.field_spec_hrrr()
+    dyn = [f for f in spec if f[1] != STATIC]
+    assert [f[:3] for f in dyn[-9:-1]] == [(12, 1, p) for p in (1000, 975, 950, 925, 900, 850, 800, 700)]
+    assert dyn[-1][:3] == (13, 2, 0)
+    assert spec[-1][0] == columns.HSURF and spec[-1][1] == STATIC
+    assert abs(dyn[-2][3] - 1e-7) < 1e-12 and dyn[-1][3] == 1.0
+    assert len(spec) == 36
+
+
+def test_clmr_round_trip_resolution():
+    v = np.array([0.0, 1e-6, 2.5e-4, 6.0e-3, np.nan])
+    c = quantize(v, 1e-7, 0.0)
+    back = dequantize(c, 1e-7, 0.0)
+    assert np.allclose(back[:4], v[:4], atol=1e-7) and np.isnan(back[4])
+
+
 def test_field_spec_hrrr():
     spec = columns.field_spec_hrrr()
-    assert len(spec) == 27
+    assert len(spec) == 36
     assert all(f[2] != 80 for f in spec)
     assert all(f[0] != columns.WW for f in spec)
     assert spec[-1][:2] == (columns.HSURF, STATIC)

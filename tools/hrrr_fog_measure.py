@@ -8,7 +8,7 @@ import datetime as dt, os, struct, sys, urllib.request, zlib
 import numpy as np
 import eccodes
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from pipeline.columns import (T, RH, GH, HSURF, STATIC, PRESSURE_HPA, HEIGHT_AGL_M, _QUANT,
+from pipeline.columns import (T, RH, GH, HSURF, CLMR, VIS, STATIC, PRESSURE_HPA, HEIGHT_AGL_M, _QUANT,
                               quantize, _planes, MAGIC, _HEADER, _FIELD, ZLIB_LEVEL)
 
 HOST = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
@@ -70,6 +70,9 @@ def wanted(f):
             out.append(((k, PRESSURE_HPA, p), v, f"{p} mb"))
     out.append(((T, HEIGHT_AGL_M, 2), "TMP", "2 m above ground"))
     out.append(((RH, HEIGHT_AGL_M, 2), "RH", "2 m above ground"))
+    for p in LEVELS:   # 2026-11-18: cloud water per level, then surface visibility
+        out.append(((CLMR, PRESSURE_HPA, p), "CLMR", f"{p} mb"))
+    out.append(((VIS, HEIGHT_AGL_M, 0), "VIS", "surface"))
     return out
 
 

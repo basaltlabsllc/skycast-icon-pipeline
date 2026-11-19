@@ -22,6 +22,12 @@ def fake_read(run, fh, get):
     j, i = np.divmod(np.arange(nx * ny), nx)
     out = {"lat": np.zeros(nx * ny), "lon": np.zeros(nx * ny), "Nx": nx, "Ny": ny, "grid": dict(GRID)}
     for n, key in enumerate(FOG_FIELDS):
+        if key[0] == "CLMR":   # kg/kg: 1e-4 up to a few 1e-4
+            out[key] = 1e-4 + 1e-8 * i + 1e-8 * j
+            continue
+        if key[0] == "VIS":    # metres
+            out[key] = 8000.0 + i + j
+            continue
         base = {"TMP": 10.0, "RH": 60.0, "HGT": 500.0 + 10 * n}[key[0]]
         out[key] = base + 0.01 * i + 0.02 * j + fh + 0.1 * n
     return out
@@ -63,7 +69,7 @@ def test_build_fog_writes_blocks(patched, tmp_path):
     assert (d["sw_lat"], d["sw_lon"], d["spacing_mdeg"], d["cols"], d["rows"]) == (44, -122, 25, 41, 41)
     d1 = decode_columns((root / "N44W122" / "1.icc").read_bytes())
     assert d1["step_hours"] == [base + 6, base + 7]
-    assert len(d["spec"]) == 27
+    assert len(d["spec"]) == 36
 
 
 def test_build_fog_values(patched, tmp_path):
