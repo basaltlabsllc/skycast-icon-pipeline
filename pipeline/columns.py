@@ -36,7 +36,8 @@ _FIELD = struct.Struct("<BBHff")        # kind, levelType, level, scale, offset
 
 # Kinds. Units are the app's (Open-Meteo's): °C, %, metres above sea level.
 T, RH, GH, HSURF, WW = 1, 2, 3, 4, 5
-KIND_NAMES = {T: "T", RH: "RH", GH: "GH", HSURF: "HSURF", WW: "WW"}
+CLMR, VIS = 12, 13   # cloud water mixing ratio (kg/kg), surface visibility (m); HRRR fog tiles only
+KIND_NAMES = {T: "T", RH: "RH", GH: "GH", HSURF: "HSURF", WW: "WW", CLMR: "CLMR", VIS: "VIS"}
 # Level types. STATIC fields hold one value per node, not one per step.
 STATIC, PRESSURE_HPA, HEIGHT_AGL_M = 0, 1, 2
 
@@ -44,7 +45,7 @@ STATIC, PRESSURE_HPA, HEIGHT_AGL_M = 0, 1, 2
 # between levels; Open-Meteo also answers in 0.1 °C), 1 % RH, 1 m height;
 # WW is the WMO 4677 code itself (0-99).
 _QUANT = {T: (0.1, -150.0), RH: (1.0, 0.0), GH: (1.0, -1000.0), HSURF: (1.0, -1000.0),
-          WW: (1.0, 0.0)}
+          WW: (1.0, 0.0), CLMR: (1e-7, 0.0), VIS: (1.0, 0.0)}
 
 
 def field_spec(plevels):
@@ -71,9 +72,13 @@ HRRR_PLEVELS = (1000, 975, 950, 925, 900, 850, 800, 700)
 
 def field_spec_hrrr():
     """field_spec's order for HRRR's fog tiles: no T at 80 m, no WW (neither is
-    in wrfprsf). 8 levels x (T, RH, GH), T and RH at 2 m, static HSURF = 27."""
-    return [f for f in field_spec(HRRR_PLEVELS)
+    in wrfprsf). 8 levels x (T, RH, GH), T and RH at 2 m, CLMR per level, surface
+    VIS, then static HSURF = 36."""
+    base = [f for f in field_spec(HRRR_PLEVELS)
             if not (f[0] == WW or (f[0] == T and f[1] == HEIGHT_AGL_M and f[2] == 80))]
+    extra = [(CLMR, PRESSURE_HPA, int(p)) + _QUANT[CLMR] for p in HRRR_PLEVELS]
+    extra.append((VIS, HEIGHT_AGL_M, 0) + _QUANT[VIS])
+    return base[:-1] + extra + base[-1:]
 
 
 def quantize(values, scale, offset):

@@ -2,7 +2,8 @@
 # onto a lat/lon lattice.
 #
 # Fields come from the wrfprsf file by idx + byte range (as hrrr/grib.py does):
-# T, RH and height at 1000..700 mb, plus 2 m T/RH and surface height. The grid is
+# T, RH and height at 1000..700 mb, plus 2 m T/RH, surface height, CLMR per level
+# (kg/kg) and surface VIS (m). The grid is
 # HRRR's Lambert conformal; lcc_ij inverts it so a lat/lon lattice can be
 # bilinearly sampled from the native 3 km cells.
 #
@@ -19,7 +20,8 @@ import eccodes
 _LEVELS = (1000, 975, 950, 925, 900, 850, 800, 700)
 FOG_FIELDS = tuple(
     f for p in _LEVELS for f in (("TMP", f"{p} mb"), ("RH", f"{p} mb"), ("HGT", f"{p} mb"))
-) + (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface"))
+) + (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface")) \
+    + tuple(("CLMR", f"{p} mb") for p in _LEVELS) + (("VIS", "surface"),)
 
 EARTH_R = 6371229.0  # HRRR's sphere
 _PRS = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{d}/conus/hrrr.t{h:02d}z.wrfprsf{f:02d}.grib2"

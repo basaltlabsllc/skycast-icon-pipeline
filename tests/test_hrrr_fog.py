@@ -13,8 +13,10 @@ from hrrr.fog import (fog_ranges, grid_keys, FOG_FIELDS, prs_url, lcc_params, lc
 def test_fog_fields_order():
     assert FOG_FIELDS[0] == ("TMP", "1000 mb")
     assert FOG_FIELDS[2] == ("HGT", "1000 mb")
-    assert FOG_FIELDS[-3:] == (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface"))
-    assert len(FOG_FIELDS) == 27
+    assert FOG_FIELDS[24:27] == (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface"))
+    assert FOG_FIELDS[27:35] == tuple(("CLMR", f"{p} mb") for p in (1000, 975, 950, 925, 900, 850, 800, 700))
+    assert FOG_FIELDS[35] == ("VIS", "surface")
+    assert len(FOG_FIELDS) == 36
 
 
 def test_prs_url():
@@ -105,7 +107,7 @@ def test_read_fog_fields_units(monkeypatch):
     assert np.isnan(rh[0]) and np.allclose(rh[1:], [50.0, 60.0, 70.0], atol=1e-3)
     assert np.allclose(out[("HGT", "surface")], [1, 2, 3, 4], atol=1e-3)
     assert sorted(out["lon"].tolist()) == [-110.0, -110.0, -109.0, -109.0]
-    assert len(out) == 32
+    assert len(out) == 41
     assert out["Nx"] == 2 and out["Ny"] == 2 and out["grid"]["LoVInDegrees"] == 262.5
 
 
@@ -113,7 +115,7 @@ def test_fog_ranges_bounds_and_missing():
     lines = [f"{n}:{n * 100}:d=2026111012:{k[0]}:{k[1]}:anl:" for n, k in enumerate(FOG_FIELDS, 1)]
     r = fog_ranges("\n".join(lines) + "\n", 0)
     assert r[FOG_FIELDS[0]] == (100, 199)
-    assert r[FOG_FIELDS[-1]] == (2700, None)
+    assert r[FOG_FIELDS[-1]] == (3600, None)
     with pytest.raises(KeyError):
         fog_ranges("\n".join(lines[:-1]) + "\n", 0)
     with pytest.raises(KeyError):
