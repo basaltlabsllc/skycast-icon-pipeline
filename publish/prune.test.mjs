@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize, runIdOf, runIdMs, runFilePath } from './prune.mjs';
+import { manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize, runIdOf, runIdMs, runFilePath, FOG_KEEP_HOURS } from './prune.mjs';
 
 const cur = { tiles: 'tiles/2026100200', tail: { tiles: 'tail/2026100200' } };
 const prev = { tiles: 'tiles/2026100118', tail: { tiles: 'tail/2026100112' } };
@@ -157,6 +157,32 @@ test('with keepHours, runs begun within it keep their clouds, thickness and run 
     'tiles/2026111419/a.icl', 'thick/2026111419/a.ict', 'fog/2026111419/x/0.icc', 'runs/2026111419.json',
     'tiles/2026111418/a.icl', 'thick/2026111418/a.ict', 'runs/2026111418.json',
   ]);
+});
+
+// FOG HISTORY: each run within FOG_KEEP_HOURS keeps its pack's first block and index.
+test('with keepHours, runs begun within 24 h keep fog pack block 0 and its index; the rest of their fog goes', () => {
+  assert.equal(FOG_KEEP_HOURS, 24);
+  const current = { runMs: 1794855600000, tiles: 'tiles/2026111619', fog: { pack: 'fog/2026111619/pack' } };
+  const previous = { runMs: 1794852000000, tiles: 'tiles/2026111618', fog: { pack: 'fog/2026111618/pack' } };
+  const paths = [
+    'fog/2026111619/pack/1.iccp',
+    // 6 h back: block 0 and the index stay, the later blocks and per-tile files go
+    'fog/2026111613/pack/0.iccp', 'fog/2026111613/pack/index.json', 'fog/2026111613/pack/1.iccp', 'fog/2026111613/N44W122/0.icc',
+    // 19Z − 24 h = 2026-11-15T19Z: kept; 18Z that day is 25 h back: gone
+    'fog/2026111519/pack/0.iccp', 'fog/2026111519/pack/index.json',
+    'fog/2026111518/pack/0.iccp', 'fog/2026111518/pack/index.json',
+    // not a pack's block 0
+    'fog/2026111613/pack/0.iccp.tmp', 'fog/2026111613/pack/10.iccp',
+  ];
+  assert.deepEqual(pathsToDelete(paths, { current, previous, keepHours: 48 }), [
+    'fog/2026111613/pack/1.iccp', 'fog/2026111613/N44W122/0.icc',
+    'fog/2026111518/pack/0.iccp', 'fog/2026111518/pack/index.json',
+    'fog/2026111613/pack/0.iccp.tmp', 'fog/2026111613/pack/10.iccp',
+  ]);
+  // Without keepHours (every other feed) nothing of an older run's fog stays.
+  assert.deepEqual(pathsToDelete(['fog/2026111613/pack/0.iccp'], { current, previous }), ['fog/2026111613/pack/0.iccp']);
+  // A keepHours under 24 bounds the fog history too.
+  assert.deepEqual(pathsToDelete(['fog/2026111613/pack/0.iccp', 'fog/2026111617/pack/0.iccp'], { current, previous, keepHours: 3 }), ['fog/2026111613/pack/0.iccp']);
 });
 
 test('Clear Night packed only: the pack folder of the current and previous runs is kept, older runs go', () => {
