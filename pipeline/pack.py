@@ -136,13 +136,20 @@ def try_pack(root, rel, dest=None, free=None):
 # entries (tail, thick, columns, wind) get "pack" inside, beside their "tiles".
 TOP_LEVEL = ("tiles", "blocks")
 ENTRIES = ("tail", "thick", "columns", "wind")
+# Kinds whose per-file key stays even with tile files off: the app's wind
+# readers (SkyCast src/feedwind.js, src/snapshotwind.js, TestFlight build 148)
+# read wind/<run>/<group>.icw only, never the pack. Wind is 162 small files a
+# run (about $0.40 a month of puts across the four models); it goes pack-only
+# once those readers read the pack and that app has shipped.
+KEEP_FILES = ("wind",)
 
 
 def add_pack_keys(manifest, packs, tile_files=True):
     """A copy of `manifest` with the pack keys of `packs` ({kind: pack path or
     None}) added. With tile_files False, a kind whose pack exists loses its
     per-file key (top-level "tiles"/"blocks", or the entry's "tiles"); a kind
-    with no pack keeps it, so its files are still named and uploaded."""
+    with no pack, or in KEEP_FILES, keeps it, so its files are still named and
+    uploaded."""
     m = dict(manifest)
     for kind, path in packs.items():
         if not path:
@@ -156,7 +163,7 @@ def add_pack_keys(manifest, packs, tile_files=True):
                 continue
             e = dict(m[kind])
             e["pack"] = path
-            if not tile_files:
+            if not tile_files and kind not in KEEP_FILES:
                 e.pop("tiles", None)
             m[kind] = e
         else:

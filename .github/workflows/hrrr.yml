@@ -38,7 +38,7 @@ jobs:
           # Keep 48 h of runs (clouds, thickness, runs/<run>.json) for SkyCast reports filled late (publish/prune.mjs RUN HISTORY).
           BLOB_KEEP_RUN_HOURS: "48"
           # hrrr_fog_build.py: "1" writes the per-tile fog files AND the packs (fog/<run>/pack/); "0" drops the per-tile files once the app that reads packs is out.
-          FOG_TILE_FILES: "1"
+          FOG_TILE_FILES: "0"
         run: |
           # The 3 km fog columns build in the BACKGROUND (up to 30 min), so they
           # never hold up the next cloud check: a pass is a finished fog build's

@@ -122,7 +122,10 @@ def test_tile_files_off_names_only_the_packs(small, tmp_path, monkeypatch, model
     man = _build(model, out)
     assert "tile files off" in capsys.readouterr().out
     for kind in KINDS[model.name]:
-        assert _per_file(man, kind) is None, kind
+        if kind in pack.KEEP_FILES:      # wind: the app reads it per file, so it stays named per file too
+            assert _per_file(man, kind) == f"{kind}/{R}", kind
+        else:
+            assert _per_file(man, kind) is None, kind
         assert _is_pack(_pack_key(man, kind), f"{kind}/{R}"), kind
         assert (out / _pack_key(man, kind) / "all.bin").is_file()
     # The rest of the manifest is untouched.

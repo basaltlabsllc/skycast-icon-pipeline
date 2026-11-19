@@ -133,7 +133,7 @@ def test_add_pack_keys_off_drops_the_per_file_keys_of_packed_kinds_only():
     assert out["blocks"] == "blocks/R" and "blocksPack" not in out   # no pack: the files stay named
     assert out["tail"] == {"run": "x", "pack": "tail/T/pack"}
     assert out["thick"] == {"tiles": "thick/R"}
-    assert out["wind"] == {"pack": "wind/R/pack"}
+    assert out["wind"] == {"tiles": "wind/R", "pack": "wind/R/pack"}   # KEEP_FILES: the app reads wind per file
 
 
 def test_live_counts_a_pack_only_blob_manifest_as_whole():

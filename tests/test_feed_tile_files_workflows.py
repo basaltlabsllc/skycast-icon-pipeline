@@ -1,7 +1,8 @@
-# FEED_TILE_FILES (pipeline/pack.py) is set explicitly to "1" on the step that
-# runs each feed's build, in all four Blob feeds' workflows: both layouts (per
-# file and packs) go up until Erik flips it, after the app that reads packs is
-# on phones. The packing never changes a workflow's time limits.
+# FEED_TILE_FILES (pipeline/pack.py) is set explicitly on the step that runs
+# each feed's build, in all four Blob feeds' workflows. It was "1" (both
+# layouts) until the app that reads packs was on every phone (TestFlight build
+# 148); Erik switched it to "0" (packs only, wind still per file: KEEP_FILES)
+# on 2026-11-19. The packing never changes a workflow's time limits.
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ def test_feed_tile_files_is_on_for_the_build_step(wf):
     step = _step(text, name)
     assert command in step
     env = step.split("run: |")[0]
-    assert 'FEED_TILE_FILES: "1"' in env
+    assert 'FEED_TILE_FILES: "0"' in env
     assert text.count("FEED_TILE_FILES") == 1
     assert limit in text
 
