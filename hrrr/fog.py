@@ -20,8 +20,8 @@ import eccodes
 _LEVELS = (1000, 975, 950, 925, 900, 850, 800, 700)
 FOG_FIELDS = tuple(
     f for p in _LEVELS for f in (("TMP", f"{p} mb"), ("RH", f"{p} mb"), ("HGT", f"{p} mb"))
-) + (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface")
-) + tuple(("CLMR", f"{p} mb") for p in _LEVELS) + (("VIS", "surface"),)
+) + (("TMP", "2 m above ground"), ("RH", "2 m above ground"), ("HGT", "surface")) \
+    + tuple(("CLMR", f"{p} mb") for p in _LEVELS) + (("VIS", "surface"),)
 
 EARTH_R = 6371229.0  # HRRR's sphere
 _PRS = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{d}/conus/hrrr.t{h:02d}z.wrfprsf{f:02d}.grib2"

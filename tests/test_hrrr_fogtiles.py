@@ -87,6 +87,14 @@ def test_build_fog_values(patched, tmp_path):
             want = 10 + 0.01 * fi[r, c] + 0.02 * fj[r, c] + step
             assert abs(t[r, c, step] - want) < 0.06, (r, c, step)
     assert abs(fi[0, 40] - fi[40, 0]) > 20   # the two corners really differ
+    # CLMR (kind 12) and VIS (kind 13) dequantise back within one quantum.
+    kinds = [sp[0] for sp in d["spec"]]
+    clmr = dequantize(d["fields"][kinds.index(12)], d["spec"][kinds.index(12)][3], d["spec"][kinds.index(12)][4])
+    vis = dequantize(d["fields"][kinds.index(13)], d["spec"][kinds.index(13)][3], d["spec"][kinds.index(13)][4])
+    for r, c in ((0, 40), (40, 0), (13, 27)):
+        for step in (0, 1):
+            assert abs(clmr[r, c, step] - (1e-4 + 1e-8 * (fi[r, c] + fj[r, c]))) <= 1e-7, (r, c, step)
+            assert abs(vis[r, c, step] - (8000.0 + fi[r, c] + fj[r, c])) <= 1.0, (r, c, step)
 
 
 def test_build_fog_entry(patched, tmp_path):

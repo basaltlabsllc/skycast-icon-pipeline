@@ -100,7 +100,7 @@ def build_fog(run, out_dir, get, steps, tile_files=True):
     static = quantize(_sample(first, ("HGT", "surface"), ny, nx, fi, fj),
                       sta_spec[0][3], sta_spec[0][4])[:, None]             # [tiles][1][n][n]
     codes0 = codes_for(first)
-    del first   # the raw step-0 fields are 27 x 1.9 M floats; keep only the codes
+    del first   # the raw step-0 fields are 36 x 1.9 M floats; keep only the codes
 
     root = out_dir / fog_path(run)
     pack_dir = out_dir / pack_path(run)
