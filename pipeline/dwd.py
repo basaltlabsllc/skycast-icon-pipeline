@@ -109,6 +109,28 @@ COLUMN_SFIELDS = ["T_2M", "RELHUM_2M", "WW"]        # single level, per step
 # — so 118/119 bracket 80 m almost everywhere and 117/118 where 118 is lower.
 COLUMN_MLEVELS = [117, 118, 119]
 COLUMN_HHL_LEVELS = [117, 118, 119, 120]            # bounds of those full levels
+# Cloud water per pressure level (the column's CLMR fields, kind 12). ICON
+# publishes cloud water (QC, kg/kg) ONLY on model levels (grib/<HH>/qc/,
+# levels 1-120, the same steps as T; listing checked 2026-11-19), so CLMR at a
+# pressure level is QC interpolated in HEIGHT to that level's GH, between the
+# two of these full levels that bracket it (run_build.clmr_at_heights).
+#
+# Levels 99-120: the fewest whose full levels reach, at every node, above the
+# highest 700 hPa height (measured 2026-11-19/20 on DWD's HHL, all 2,949,120
+# cells and the 0.25 deg column lattice; GH from the 2026-11-20 00Z run, all
+# 93 steps). Full-level height, sea level min / median / max (m):
+#   120:  -336 /   10 / 6232   (always 10-11 m above the model ground)
+#   101:  3003 / 3038 / 7448
+#   100:  3278 / 3310 / 7570
+#    99:  3563 / 3592 / 7697
+#    98:  3859 / 3885 / 7830
+# GH 700 hPa peaked at 3286 m; at the worst node and step it sat 323 m under
+# level 99, 41 m under level 100 (too thin a margin for a deeper low), and
+# above level 101 at up to 397,281 nodes. So 99 is the top: 22 QC files a
+# step, HHL 99-121.
+QC_TOP = 99
+COLUMN_QC_MLEVELS = list(range(QC_TOP, 121))
+COLUMN_QC_HHL_LEVELS = list(range(QC_TOP, 122))     # bounds of those full levels (121 = the ground)
 
 
 def pressure_file_name(run, step, level, field):
@@ -141,6 +163,21 @@ def column_files(run, steps):
         for f in COLUMN_SFIELDS:
             out[f].append(file_name(run, s, f))
     return out
+
+
+def column_qc_files(run, steps):
+    """{directory field: [file names]} — the cloud-water files: QC on each of
+    COLUMN_QC_MLEVELS per step, and their HHL half levels once per run. Kept
+    apart from column_files on purpose: they never decide whether the columns
+    are built (a late or missing QC file leaves CLMR missing, nothing else)."""
+    return {"QC": [model_file_name(run, s, lv, "QC") for s in steps for lv in COLUMN_QC_MLEVELS],
+            "HHL": [invariant_file_name(run, "HHL", lv) for lv in COLUMN_QC_HHL_LEVELS]}
+
+
+def listed_qc_steps(listing, run, steps):
+    """`listing(hh, field) -> html`. The steps whose every QC file is listed."""
+    html = listing(f"{run:%H}", "QC") or ""
+    return [s for s in steps if all(model_file_name(run, s, lv, "QC") in html for lv in COLUMN_QC_MLEVELS)]
 
 
 def missing_column_files(listing, run, steps):
