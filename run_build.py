@@ -768,19 +768,35 @@ def fetch_columns(deps, kit, work, run, steps, workers, stride):
         _CLOCK.clear()
     static, w80 = column_statics(deps, kit, work, run, stride)
     keys = column_keys()
+    row = {k: i for i, k in enumerate(keys)}
+    at = {s: i for i, s in enumerate(steps)}
     groups = list(dwd.COLUMN_PFIELDS) + list(dwd.COLUMN_SFIELDS) + ["T_80M"]
     jobs = [(s, g) for s in steps for g in groups]
-    got = {s: {} for s in steps}
+    # Each job writes its codes straight into ONE [steps][fields][LY][LX]
+    # array and returns only their keys, so every code exists once. (Until
+    # 2026-11-20 the jobs' dicts were stacked per step afterwards while the
+    # futures still held them: every code twice, 4.8 GB extra at the end of
+    # the fetch on the real lattice. np.empty touches no page until written.)
+    cube = np.empty((len(steps), len(keys)) + tuple(static.shape[1:]), dtype=np.uint16)
+    filled = np.zeros((len(steps), len(keys)), dtype=bool)
+
+    def job(s, g):
+        out = column_step(deps, kit, work, run, s, g, stride, w80)
+        done = [k for k in out if k in row]
+        for k in done:
+            cube[at[s], row[k]] = out[k]
+        return done
+
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(column_step, deps, kit, work, run, s, g, stride, w80) for s, g in jobs]
+        futs = [pool.submit(job, s, g) for s, g in jobs]
         for (s, g), fut in zip(jobs, futs):
-            got[s].update(fut.result())
+            for k in fut.result():
+                filled[at[s], row[k]] = True
+    if not filled.all():
+        i, j = np.argwhere(~filled)[0]
+        raise KeyError(f"column field {keys[j]} +{steps[i]} never fetched")
     base = history.hour_of(run)
-    own = []
-    for s in steps:
-        fields = got.pop(s)
-        own.append((base + s, np.stack([fields[k] for k in keys])))
-    return static, own
+    return static, [(base + s, cube[at[s]]) for s in steps]
 
 
 def write_columns(blob_dir, run, names, stride, static, stacks, workers=1):

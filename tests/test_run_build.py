@@ -662,6 +662,24 @@ def test_a_full_build_publishes_columns_for_every_square(tmp_path):
     assert len(m["columns"]["stepsMs"]) == len(STEPS)
 
 
+def test_a_column_field_no_job_filled_fails_the_columns_never_ships_garbage(tmp_path, monkeypatch, capsys):
+    # The jobs write into one uninitialised array: a field no job wrote must
+    # fail the columns (as a missing key always did), never ship as noise.
+    real = run_build.column_step
+
+    def lossy(*a, **k):
+        out = real(*a, **k)
+        out.pop(("WW", None), None)
+        return out
+    monkeypatch.setattr(run_build, "column_step", lossy)
+    steps = [0, 1]
+    deps, _ = _deps_with_columns(tmp_path, steps)
+    assert _columns_build(tmp_path, deps, steps) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    assert m["columns"] is None
+    assert "never fetched" in capsys.readouterr().out
+
+
 def test_column_files_not_yet_listed_wait_then_publish_without_columns(tmp_path, capsys):
     steps = [0, 1]
     deps, calls = _deps_with_columns(tmp_path, steps, column_steps=[0])         # step 1 never lands
