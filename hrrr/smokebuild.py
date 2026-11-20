@@ -119,10 +119,14 @@ def build_run(run, last_fh, out_dir, get, sleep=time.sleep, budget_s=SMOKE_BUDGE
             print(f"::warning::smoke {rel}: over budget ({clock() - t0:.0f} s), dropped")
         else:
             print(f"::warning::smoke {rel} failed: {type(e).__name__}: {e}")
-        shutil.rmtree(folder, ignore_errors=True)
+        # remove only what this call made: its loose files and its own pack,
+        # never an earlier pack of the same run folder
+        for f in folder.glob("*.smk"):
+            f.unlink(missing_ok=True)
+        if pack:
+            shutil.rmtree(out_dir / pack, ignore_errors=True)
         pack = None
-    # leave no empty smoke/ behind
-    for d in (out_dir / "smoke",):
+    for d in (folder, out_dir / "smoke"):
         if d.is_dir() and not any(d.iterdir()):
             d.rmdir()
     if pack:

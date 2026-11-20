@@ -137,3 +137,44 @@ def test_main_short_only_when_long_fails(tmp_path):
 def test_main_fails_when_nothing_built(tmp_path):
     assert run_main(tmp_path, {}, lambda *a: None) == 1
     assert not (tmp_path / "o/smoke/latest.json").exists()
+
+
+def test_failed_build_keeps_earlier_pack_in_same_run_folder(tmp_path):
+    f = serve_run(RUN, 2)
+    first = sb.build_run(RUN, 1, tmp_path, f.get, lambda s: None)
+    assert first
+
+    def get(url, rng=None):
+        if "f02" in url:
+            raise IOError("boom")
+        return f.get(url, rng)
+
+    assert sb.build_run(RUN, 2, tmp_path, get, lambda s: None) is None
+    assert (tmp_path / first / "all.bin").is_file()
+    assert not list((tmp_path / "smoke" / "2026112003").glob("*.smk"))
+
+
+def test_main_same_run_built_once_as_long_and_short_names_same_pack(tmp_path):
+    ex = exists_of([hg.file_url(L, 18), hg.file_url(L, 48)])
+    calls = []
+
+    def build(run, last, out, get, sleep, budget, clock):
+        calls.append((run, last))
+        return "smoke/2026112000/pack-bbbbbbbbbbbb"
+
+    now = datetime(2026, 11, 20, 0, 30, tzinfo=UTC)
+    assert app.main(["--out", str(tmp_path / "o")], fetch_live=lambda u: {}, get=None, exists=ex,
+                    now=lambda: now, sleep=lambda s: None, build=build) == 0
+    assert calls == [(L, 48)]
+    idx = json.loads((tmp_path / "o/smoke/latest.json").read_text())
+    assert idx["short"]["pack"] == idx["long"]["pack"] == "smoke/2026112000/pack-bbbbbbbbbbbb"
+    assert idx["short"]["runMs"] == idx["long"]["runMs"] == ms(L)
+    assert len(idx["past"]) == 1
+
+
+def test_main_same_run_long_failure_writes_nothing(tmp_path):
+    ex = exists_of([hg.file_url(L, 18), hg.file_url(L, 48)])
+    now = datetime(2026, 11, 20, 0, 30, tzinfo=UTC)
+    assert app.main(["--out", str(tmp_path / "o")], fetch_live=lambda u: {}, get=None, exists=ex,
+                    now=lambda: now, sleep=lambda s: None, build=lambda *a: None) == 1
+    assert not (tmp_path / "o").exists()

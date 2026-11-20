@@ -51,7 +51,12 @@ def main(argv=None, fetch_live=_fetch_live, get=_get, exists=_exists, now=_now,
             run = want[kind]
             if run is not None and (live.get(kind) or {}).get("runMs") != sb.run_ms(run):
                 todo.append((kind, run, last))
-        if not todo:
+        # one run that is both the short and the long one is built once, as long;
+        # the short entry then names the long pack (it holds f00..f48)
+        alias = want["short"] is not None and want["short"] == want["long"]
+        if alias:
+            todo = [t for t in todo if t[0] != "short"]
+        if not todo and not (alias and (live.get("short") or {}).get("runMs") != sb.run_ms(want["short"])):
             print("live smoke index already carries the wanted runs")
             return NOTHING_TO_DO
         out = Path(a.out)
@@ -63,6 +68,12 @@ def main(argv=None, fetch_live=_fetch_live, get=_get, exists=_exists, now=_now,
                 built[kind] = {"run": run, "last": last, "pack": pack}
             else:
                 print(f"::warning::smoke {kind} run {run:%Y-%m-%dT%HZ} not built")
+        if alias:
+            src = built.get("long")
+            if src is None and (live.get("long") or {}).get("runMs") == sb.run_ms(want["long"]):
+                src = {"run": want["long"], "last": live["long"]["last"], "pack": live["long"]["pack"]}
+            if src is not None:
+                built["short"] = dict(src)
         if not built:
             print("FAILED: no smoke run could be built")
             return FAILED
