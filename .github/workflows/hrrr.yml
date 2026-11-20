@@ -114,6 +114,21 @@ jobs:
               fogpid=$!
               echo "$fogpid" > fog.pid
             fi
+            # The smoke map's HRRR packs (hrrr_smoke_build.py; 0 built, 3 nothing
+            # new, else failed). Every pass, after the cover's publish and the fog
+            # start, in this same step so its manifest never races the cover's
+            # (publish/smoke.mjs writes only smoke/). Whatever happens here never
+            # touches rc (the cover's exit code, read above) and never ends the loop.
+            set +e
+            timeout -k 10 900 python hrrr_smoke_build.py --out site-hrrr-smoke --live-index "$HRRR_BASE/smoke/latest.json"
+            src=$?
+            set -e
+            if [ "$src" = "0" ]; then
+              (cd publish && node smoke.mjs ../site-hrrr-smoke) || echo "smoke publish failed, will retry"
+            elif [ "$src" != "3" ]; then
+              echo "hrrr_smoke_build.py failed (exit $src), retrying next pass"
+            fi
+            rm -rf site-hrrr-smoke
             sleep 300
           done
           # Past the loop: give a running fog build until $drain, then stop it.

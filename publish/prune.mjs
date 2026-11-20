@@ -38,8 +38,10 @@ export function manifestFolders(m) {
 }
 
 // Folders the live publish never owns: texdev/ is the cloud-texture dev feed
-// (texdev.yml + publish/texdev.mjs), which prunes its own runs.
-export const PROTECTED_PREFIXES = ['texdev/'];
+// (texdev.yml + publish/texdev.mjs), which prunes its own runs. smoke/ is the
+// smoke map feed (publish/smoke.mjs), which prunes its own packs against its
+// own index.
+export const PROTECTED_PREFIXES = ['texdev/', 'smoke/'];
 export const isProtected = (p) => PROTECTED_PREFIXES.some((k) => p.startsWith(k));
 
 // RUN HISTORY (2026-11-16, HRRR and RRFS only: BLOB_KEEP_RUN_HOURS in

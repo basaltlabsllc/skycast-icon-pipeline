@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize, runIdOf, runIdMs, runFilePath, FOG_KEEP_HOURS } from './prune.mjs';
+import { isProtected, manifestFolders, pathsToDelete, runFolder, backlogToDelete, summarize, runIdOf, runIdMs, runFilePath, FOG_KEEP_HOURS } from './prune.mjs';
 
 const cur = { tiles: 'tiles/2026100200', tail: { tiles: 'tail/2026100200' } };
 const prev = { tiles: 'tiles/2026100118', tail: { tiles: 'tail/2026100112' } };
@@ -268,4 +268,13 @@ test('feed packs: run history keeps a kept run\'s packs (tiles and thick folders
   const cur = { ...packOnly('2026111619'), runMs: Date.UTC(2026, 10, 16, 19) };
   const paths = [`tiles/2026111618/${P}/all.bin`, `thick/2026111618/${P}/index.json`, `tiles/2026111500/${P}/all.bin`];
   assert.deepEqual(pathsToDelete(paths, { current: cur, previous: null, keepHours: 2 }), [`tiles/2026111500/${P}/all.bin`]);
+});
+
+test('smoke/ belongs to smoke.mjs: the cover prune and the backlog cleanup never delete it', () => {
+  assert.equal(isProtected('smoke/2026112000/pack-a/all.bin'), true);
+  assert.equal(isProtected('smoke/latest.json'), true);
+  const m = { tiles: 'tiles/b' };
+  const paths = ['smoke/2026112000/pack-a/all.bin', 'smoke/latest.json', 'tiles/a/x.icl'];
+  assert.deepEqual(pathsToDelete(paths, { current: m, previous: null }), ['tiles/a/x.icl']);
+  assert.deepEqual(backlogToDelete(['smoke/2026112000/pack-a/all.bin', 'tiles/a/x.icl', 'tiles/b/x.icl'], m), []);
 });
