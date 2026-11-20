@@ -35,8 +35,6 @@ DWD ICON global open data (listing of `grib/00/*` checked 2026-10-02 by the
 | weather code (fog, rain, snow, thunder) | `single-level_…_WW` (dir `ww`) | surface | yes (2026-11-07), nearest-neighbour |
 | (for T 80 m) | `model-level_…_<lev>_T` (dir `t`), levels 1–120 | 117, 118, 119 | yes |
 | (for T 80 m) | `time-invariant_…_<lev>_HHL` (dir `hhl`), half levels 1–121 | 117–120 | yes |
-| cloud water per hPa level (CLMR, 2026-11-19) | `model-level_…_<lev>_QC` (dir `qc`), kg/kg, model levels ONLY (no pressure-level QC) | 99–120 | yes, interpolated in height to each level's GH (below) |
-| (for CLMR) | `time-invariant_…_<lev>_HHL` | 99–121 | yes |
 | (not used) | `single-level_…_T_G` (ground temperature) | surface | no: a skin temperature, not air at 80 m |
 
 All pressure-level and model-level fields have the same steps as the cloud
@@ -205,16 +203,14 @@ Field table:
 
 - kind: 1 = temperature (°C), 2 = relative humidity (%), 3 = geopotential
   height (m above sea level), 4 = model surface height HSURF (m above sea level),
-  5 = present weather WW (a WMO 4677 code, 0–99; added 2026-11-07),
-  12 = cloud water mixing ratio CLMR (kg/kg; the same kind and quantisation as
-  HRRR's column feed; added for ICON 2026-11-19).
+  5 = present weather WW (a WMO 4677 code, 0–99; added 2026-11-07).
 - levelType: 0 = static (one value per node, no time axis), 1 = pressure
   (level in hPa), 2 = height above the model surface (level in m).
 - value = offset + scale × code (scale and offset as stored, f32);
   **code 65535 = missing** (NaN in DWD's field, or a NaN after remapping).
   Codes are clamped to 0…65534.
 
-Today's table (F = 33), in body order:
+Today's table (F = 26), in body order:
 
 | # | kind | levelType | level | scale | offset |
 |---|---|---|---|---|---|
@@ -223,38 +219,13 @@ Today's table (F = 33), in body order:
 | 22 | 2 (RH) | 2 | 2 | 1 | 0 |
 | 23 | 1 (T) | 2 | 80 | 0.1 | −150 |
 | 24 | 5 (WW) | 2 | 0 | 1 | 0 |
-| 25–31 | 12 (CLMR) | 1 | 1000, 950, 925, 900, 850, 800, 700 | 1e-7 | 0 |
-| 32 | 4 (HSURF) | 0 | 0 | 1 | −1000 |
-
-Before 2026-11-19 the table was rows 0–24 and HSURF (F = 26); CLMR was
-appended after WW, so every older field keeps its index among the dynamic
-fields and a history head saved at F = 26 reads with CLMR missing.
+| 25 | 4 (HSURF) | 0 | 0 | 1 | −1000 |
 
 A decoder must read the table, not assume this order. New dynamic fields are
 appended after the last dynamic one (before the static HSURF), so a saved
 history head (state/columns/) holds a PREFIX of today's fields:
 `history.load_history_steps(…, pad=65535)` reads such a head with the new
 fields missing instead of dropping its six hours.
-
-**CLMR (cloud water, 2026-11-19).** ICON publishes cloud water `QC` only on
-model levels, so the build interpolates it to each pressure level. Per node
-and step: a model level's height is the mean of its two HHL half levels
-(`run_build.full_level_heights`); the level's GH (FI ÷ 9.80665, the same
-step's) is placed between the two model levels that bracket it and QC is
-taken linearly in height between them (`run_build.clmr_at_heights`). A GH
-below the model ground (high terrain, 1000 hPa under the Cascades) takes the
-lowest level's (120, ~10 m up) value, as HRRR's per-hPa field does there. A
-GH above the highest fetched level, a missing QC or HHL value, or a missing
-GH stays missing (65535); no value is invented. The levels fetched are
-99–120, chosen by measuring DWD's HHL: level 99's
-height runs 3563–7697 m above sea level (median 3592 m) and GH 700 hPa peaked
-at 3286 m over all 93 steps of the 2026-11-20 00Z run, so level 99 stays at
-least 323 m above every 700 hPa height (level 100 had 41 m to spare, level 101
-was below it at up to 397,281 nodes). Adding the fields cost, on that run,
-2046 QC files (483.4 MB) and 19 HHL files (24.9 MB) per run, about 5.8 % more
-download; a square's column file grows ~5–6 % (0.7 % where the air is dry).
-QC files never gate the columns: a step whose QC is not listed, or whose
-QC fails, ships with CLMR missing and every other field intact.
 
 **WW.** ICON's `ww` is the WMO 4677 present-weather subset ICON emits: 0–3
 cloud states, 45/48 fog, 51–57 drizzle, 61–67 rain, 71–77 snow, 80–86
@@ -340,14 +311,11 @@ first), into `blob/`, and published by the existing Blob step
 1. Wait until every column file of the run is listed (DWD uploads a run over
    ~20 minutes): re-list every 60 s for up to 15 min, else publish the
    clouds without columns (`columns: null`) rather than hold the feed back.
-2. HSURF and HHL 117–120 (once per run) → surface height and the T80 weights;
-   HHL 99–121 → the model-level heights for CLMR (a failure there leaves
-   CLMR missing for the run, nothing else).
+2. HSURF and HHL 117–120 (once per run) → surface height and the T80 weights.
 3. Per step, in the build's worker pool: T, RELHUM and FI each as one cdo
    call over all seven levels (the GRIB files are concatenated), T_2M,
    RELHUM_2M, WW (nearest link, not summed), and model-level T 117, 118
-   and 119 → T80, and model-level QC 99–120 (one cdo call per level) →
-   CLMR at each level's GH. Each field is quantised
+   and 119 → T80. Each field is quantised
    at once, so memory is the lattice, not the 0.125° grid.
 
 **Remap straight onto the nodes.** The cloud squares remap with
