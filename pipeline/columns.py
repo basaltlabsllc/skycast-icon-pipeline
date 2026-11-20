@@ -36,7 +36,8 @@ _FIELD = struct.Struct("<BBHff")        # kind, levelType, level, scale, offset
 
 # Kinds. Units are the app's (Open-Meteo's): °C, %, metres above sea level.
 T, RH, GH, HSURF, WW = 1, 2, 3, 4, 5
-CLMR, VIS = 12, 13   # cloud water mixing ratio (kg/kg), surface visibility (m); HRRR fog tiles only
+CLMR, VIS = 12, 13   # cloud water mixing ratio (kg/kg) per pressure level (HRRR fog tiles and ICON's
+                     # column feed), surface visibility (m; HRRR fog tiles only)
 KIND_NAMES = {T: "T", RH: "RH", GH: "GH", HSURF: "HSURF", WW: "WW", CLMR: "CLMR", VIS: "VIS"}
 # Level types. STATIC fields hold one value per node, not one per step.
 STATIC, PRESSURE_HPA, HEIGHT_AGL_M = 0, 1, 2
@@ -51,10 +52,11 @@ _QUANT = {T: (0.1, -150.0), RH: (1.0, 0.0), GH: (1.0, -1000.0), HSURF: (1.0, -10
 def field_spec(plevels):
     """The field table, in body order: per pressure level (high pressure
     first) T, RH, GH; then T at 2 m, RH at 2 m, T at 80 m, the present-
-    weather code WW; then the static model surface height. New dynamic
-    fields go LAST among the dynamic ones, so a saved history head's fields
-    stay a prefix of today's (history.load_history_steps pads the rest).
-    [(kind, levelType, level, scale, offset)]"""
+    weather code WW; then cloud water CLMR per pressure level (high pressure
+    first; added 2026-11-19); then the static model surface height. New
+    dynamic fields go LAST among the dynamic ones, so a saved history head's
+    fields stay a prefix of today's (history.load_history_steps pads the
+    rest). [(kind, levelType, level, scale, offset)]"""
     out = []
     for p in plevels:
         for k in (T, RH, GH):
@@ -63,6 +65,7 @@ def field_spec(plevels):
     out.append((RH, HEIGHT_AGL_M, 2) + _QUANT[RH])
     out.append((T, HEIGHT_AGL_M, 80) + _QUANT[T])
     out.append((WW, HEIGHT_AGL_M, 0) + _QUANT[WW])
+    out += [(CLMR, PRESSURE_HPA, int(p)) + _QUANT[CLMR] for p in plevels]
     out.append((HSURF, STATIC, 0) + _QUANT[HSURF])
     return out
 
@@ -73,9 +76,10 @@ HRRR_PLEVELS = (1000, 975, 950, 925, 900, 850, 800, 700)
 def field_spec_hrrr():
     """field_spec's order for HRRR's fog tiles: no T at 80 m, no WW (neither is
     in wrfprsf). 8 levels x (T, RH, GH), T and RH at 2 m, CLMR per level, surface
-    VIS, then static HSURF = 36."""
+    VIS, then static HSURF = 36. (field_spec's own CLMR block is dropped and
+    re-added here, so this order is the one HRRR has always published.)"""
     base = [f for f in field_spec(HRRR_PLEVELS)
-            if not (f[0] == WW or (f[0] == T and f[1] == HEIGHT_AGL_M and f[2] == 80))]
+            if not (f[0] in (WW, CLMR) or (f[0] == T and f[1] == HEIGHT_AGL_M and f[2] == 80))]
     extra = [(CLMR, PRESSURE_HPA, int(p)) + _QUANT[CLMR] for p in HRRR_PLEVELS]
     extra.append((VIS, HEIGHT_AGL_M, 0) + _QUANT[VIS])
     return base[:-1] + extra + base[-1:]

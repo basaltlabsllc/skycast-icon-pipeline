@@ -76,14 +76,52 @@ def test_field_table_names_the_app_fields_and_units():
     spec = field_spec(PLEVELS)
     T, RH, GH, HS, WW = columns.T, columns.RH, columns.GH, columns.HSURF, columns.WW
     P, H = columns.PRESSURE_HPA, columns.HEIGHT_AGL_M
+    CL = columns.CLMR
     assert [(k, lt, lv) for k, lt, lv, _, _ in spec] == (
         [(k, P, p) for p in PLEVELS for k in (T, RH, GH)]
-        + [(T, H, 2), (RH, H, 2), (T, H, 80), (WW, H, 0), (HS, STATIC, 0)])
-    assert len(spec) == 3 * len(PLEVELS) + 5
-    # WW: the WMO 4677 code itself, scale 1, offset 0, appended LAST among the
-    # dynamic fields so an older head's fields are a prefix of today's.
+        + [(T, H, 2), (RH, H, 2), (T, H, 80), (WW, H, 0)]
+        + [(CL, P, p) for p in PLEVELS]
+        + [(HS, STATIC, 0)])
+    assert len(spec) == 4 * len(PLEVELS) + 5
+    # WW: the WMO 4677 code itself, scale 1, offset 0.
     assert WW == 5 and columns.KIND_NAMES[WW] == "WW"
-    assert spec[-2] == (WW, H, 0, 1.0, 0.0)
+    assert spec[3 * len(PLEVELS) + 3] == (WW, H, 0, 1.0, 0.0)
+
+
+def test_field_table_order_is_the_old_table_plus_clmr_appended():
+    # Every field an older table had keeps its kind, level, scale, offset and
+    # its order; CLMR per pressure level (kind 12, HRRR's quantisation) comes
+    # LAST among the dynamic fields, so an older history head is a prefix.
+    spec = field_spec(PLEVELS)
+    dyn = [f for f in spec if f[1] != STATIC]
+    clmr = [f for f in spec if f[0] == columns.CLMR]
+    old = [f for f in spec if f[0] != columns.CLMR]
+    assert dyn[-len(PLEVELS):] == clmr
+    assert [f[2] for f in clmr] == PLEVELS                         # high pressure first, as T, RH, GH
+    assert all(f[:2] == (12, columns.PRESSURE_HPA) and f[3:] == (1e-7, 0.0) for f in clmr)
+    hrrr = {f[3:] for f in columns.field_spec_hrrr() if f[0] == columns.CLMR}
+    assert hrrr == {(1e-7, 0.0)}                                    # the same codes as HRRR's
+    assert len(old) == 26 and old[-1] == (columns.HSURF, STATIC, 0, 1.0, -1000.0)
+    assert old[:-1] == dyn[:-len(PLEVELS)]
+
+
+def test_clmr_codes_round_trip_through_the_file():
+    spec = field_spec(PLEVELS)
+    n = side(8)
+    ndyn = sum(1 for f in spec if f[1] != STATIC)
+    v = np.array([0.0, 1e-7, 3.3e-6, 2.5e-4, 1.2e-3, 6.5534e-3, 0.02, np.nan])  # 0.02: clamps to the top code
+    codes = quantize(v, 1e-7, 0.0)
+    assert codes.tolist() == [0, 1, 33, 2500, 12000, 65534, 65534, MISSING]
+    dyn = np.zeros((len(v), ndyn, n, n), np.uint16)
+    ci = [i for i, f in enumerate(f for f in spec if f[1] != STATIC) if f[0] == columns.CLMR]
+    dyn[:, ci[0], 1, 2] = codes                                     # CLMR at 1000 hPa, one node, every step
+    d = decode_columns(encode_columns(40, -125, 8, list(range(len(v))), spec, dyn,
+                                      np.zeros((1, n, n), np.uint16)))
+    fi = [i for i, f in enumerate(d["spec"]) if f[0] == columns.CLMR and f[2] == 1000][0]
+    sc, of = d["spec"][fi][3], d["spec"][fi][4]
+    back = dequantize(d["fields"][fi][1, 2], sc, of)
+    assert np.allclose(back[:6], v[:6], atol=0.5e-7) and back[6] == pytest.approx(6.5534e-3, abs=1e-9)
+    assert np.isnan(back[7])
 
 
 def test_missing_is_the_sentinel_both_ways():

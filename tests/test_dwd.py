@@ -159,3 +159,36 @@ def test_thickness_never_decides_the_run():
         return "".join(f'<a href="{file_name(run00, s, field)}">x</a>\n' for s in STEPS)
 
     assert newest_complete_run(listing) == run00
+
+
+def test_cloud_water_files_and_levels():
+    from pipeline.dwd import (column_qc_files, model_file_name, invariant_file_name, dir_url,
+                              COLUMN_QC_MLEVELS, COLUMN_QC_HHL_LEVELS, column_files)
+    run = dt.datetime(2026, 11, 20, 0, tzinfo=dt.timezone.utc)
+    assert model_file_name(run, 5, 120, "QC") == "icon_global_icosahedral_model-level_2026112000_005_120_QC.grib2.bz2"
+    assert dir_url(run, "QC", "f") == "https://opendata.dwd.de/weather/nwp/icon/grib/00/qc/f"
+    # Contiguous from the lowest model level (120) up; the HHL half levels are
+    # exactly their bounds (121 is the ground).
+    assert COLUMN_QC_MLEVELS == list(range(min(COLUMN_QC_MLEVELS), 121))
+    assert COLUMN_QC_HHL_LEVELS == sorted({lv for m in COLUMN_QC_MLEVELS for lv in (m, m + 1)})
+    files = column_qc_files(run, [0, 1, 81])
+    assert files["QC"] == [model_file_name(run, s, lv, "QC") for s in (0, 1, 81) for lv in COLUMN_QC_MLEVELS]
+    assert files["HHL"] == [invariant_file_name(run, "HHL", lv) for lv in COLUMN_QC_HHL_LEVELS]
+    # Not in column_files: QC never decides whether the columns are built.
+    assert "QC" not in column_files(run, [0])
+
+
+def test_listed_qc_steps_needs_every_level_of_a_step():
+    from pipeline.dwd import listed_qc_steps, model_file_name, COLUMN_QC_MLEVELS
+    run = dt.datetime(2026, 11, 20, 6, tzinfo=dt.timezone.utc)
+    names = [model_file_name(run, s, lv, "QC") for s in (0, 1, 2) for lv in COLUMN_QC_MLEVELS]
+    names.remove(model_file_name(run, 1, COLUMN_QC_MLEVELS[0], "QC"))         # step 1 lacks one level
+    html = "".join(f'<a href="{n}">x</a>\n' for n in names)
+    seen = []
+
+    def listing(hh, field):
+        seen.append((hh, field))
+        return html if (hh, field) == ("06", "QC") else ""
+    assert listed_qc_steps(listing, run, [0, 1, 2]) == [0, 2]
+    assert seen == [("06", "QC")]                                               # one listing read
+    assert listed_qc_steps(lambda hh, field: "", run, [0, 1]) == []

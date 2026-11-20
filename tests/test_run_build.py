@@ -482,15 +482,25 @@ def test_a_thickness_failure_never_fails_the_build(tmp_path, capsys):
 
 # ---- The column feed --------------------------------------------------------
 import re
-from pipeline import columns
+from pipeline import columns, history
 from pipeline.columns import decode_columns, dequantize, STATIC
-from pipeline.dwd import COLUMN_PLEVELS, COLUMN_MLEVELS, column_files
+from pipeline.dwd import COLUMN_PLEVELS, COLUMN_MLEVELS, COLUMN_QC_MLEVELS, column_files, column_qc_files
 
 # Fake DWD values in DWD's units, chosen so every app-unit number below is
 # computed from them, never typed in.
 HSURF_M = 1117.0
 # Half levels above ground, as DWD's measured: full 117 → 165 m, 118 → 95.5 m, 119 → 42 m.
 HHL_AGL = {117: 200.0, 118: 130.0, 119: 61.0, 120: 23.0}
+# Higher half levels for the cloud water, 300 m apart (ICON's are ~300 m apart
+# at 3 km), and 121 on the ground. The fake GH (8000 − 7·hPa m) puts 1000 hPa
+# at 1000 m, BELOW this 1117 m ground, and 700 hPa at 3100 m, inside.
+HHL_AGL.update({lv: 200.0 + 300.0 * (117 - lv) for lv in range(1, 117)})
+HHL_AGL[121] = 0.0
+
+
+def _qc(level, step):
+    """Fake cloud water, kg/kg: not linear in height, so a wrong pair shows."""
+    return 1e-5 * (121 - level) ** 1.5 + 1e-6 * step
 
 
 # Half a quantisation step (columns._QUANT), plus the float32 the remapped
@@ -513,6 +523,10 @@ def _column_value(name):
     if m:
         step, lv = int(m.group(1)), int(m.group(2))
         return lv, 275.0 + step + (118 - lv) * 1.5
+    m = re.search(r"_model-level_\d{10}_(\d{3})_(\d+)_QC\.", name)
+    if m:
+        step, lv = int(m.group(1)), int(m.group(2))
+        return lv, _qc(lv, step)
     m = re.search(r"_time-invariant_\d{10}_(\d+)_HHL\.", name)
     if m:
         return int(m.group(1)), HSURF_M + HHL_AGL[int(m.group(1))]
@@ -541,9 +555,12 @@ def _fake_lattice_levels(paths, kit, work, stride, nearest=False):
     return out
 
 
-def _deps_with_columns(tmp_path, steps, column_steps=None, **fake):
+def _deps_with_columns(tmp_path, steps, column_steps=None, qc_steps=None, **fake):
     deps, calls = _fake_deps(tmp_path, **fake)
     files = column_files(RUN, steps if column_steps is None else column_steps)
+    qc = column_qc_files(RUN, steps if qc_steps is None else qc_steps)
+    files["QC"] = qc["QC"]
+    files["HHL"] = sorted(set(files["HHL"]) | set(qc["HHL"]))
 
     run = RUN
 
@@ -761,7 +778,9 @@ def test_column_history_saved_before_ww_is_padded_with_missing(tmp_path):
         assert head.shape[1] == len(run_build.column_keys())
         with np.load(p) as z:                                         # new heads name their fields
             assert list(z["fields"]) == run_build.column_field_names()
-        np.savez_compressed(p, head=head[:, :-1], run_hour=rh)       # the pre-WW layout (no field list)
+        # the pre-WW layout (no field list): every field before WW (WW and the
+        # later CLMR block gone).
+        np.savez_compressed(p, head=head[:, :-(1 + len(COLUMN_PLEVELS))], run_hour=rh)
     global RUN
     first, RUN = RUN, RUN + dt.timedelta(hours=6)
     try:
@@ -982,3 +1001,248 @@ def test_a_repair_that_changes_the_squares_gets_new_pack_folders(tmp_path, monke
     assert a["tilesPack"] == b["tilesPack"] and a["blocksPack"] == b["blocksPack"]
     assert a["tilesPack"] != c["tilesPack"] and a["blocksPack"] != c["blocksPack"]
     assert a["tiles"] == c["tiles"]                              # the run folder itself is the same
+
+
+# ---- Cloud water (CLMR) in the column feed ----------------------------------
+TOL_CLMR = columns._QUANT[columns.CLMR][0] / 2 + 1e-9
+
+
+def _full_msl(lv):
+    return HSURF_M + (HHL_AGL[lv] + HHL_AGL[lv + 1]) / 2
+
+
+def _clmr_want(p, step):
+    """CLMR at p hPa from the fakes, computed independently: the bracketing
+    pair found by a plain scan, the lowest level's value at or below it."""
+    gh = 8000 - 7 * p
+    levels = sorted(COLUMN_QC_MLEVELS, reverse=True)               # 120 (lowest) first
+    if gh <= _full_msl(levels[0]):
+        return _qc(levels[0], step)
+    for lo, up in zip(levels, levels[1:]):
+        if _full_msl(lo) <= gh <= _full_msl(up):
+            f = (gh - _full_msl(lo)) / (_full_msl(up) - _full_msl(lo))
+            return _qc(lo, step) + f * (_qc(up, step) - _qc(lo, step))
+    return float("nan")
+
+
+def test_clmr_is_qc_interpolated_in_height_to_each_levels_gh(tmp_path):
+    steps = [0, 1]
+    deps, _ = _deps_with_columns(tmp_path, steps)
+    _columns_build(tmp_path, deps, steps)
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    d = decode_columns((tmp_path / "blob" / m["columns"]["tiles"] / "N40W125.icc").read_bytes())
+    assert 8000 - 7 * 1000 < HSURF_M                                   # the 1000 hPa case is below ground
+    for s in steps:
+        for p in COLUMN_PLEVELS:
+            want = _clmr_want(p, s)
+            assert np.isfinite(want)
+            assert _value(d, columns.CLMR, columns.PRESSURE_HPA, p, s=s) == pytest.approx(want, abs=TOL_CLMR), p
+        # the old fields are untouched
+        assert _value(d, columns.WW, columns.HEIGHT_AGL_M, 0, s=s) == _ww_code(s)
+
+
+def test_clmr_at_heights_brackets_clamps_below_and_never_invents():
+    # Three levels at 100, 400, 1000 m MSL; QC 3e-4, 1e-4, 0.
+    z = {120: np.full(7, 100.0), 119: np.full(7, 400.0), 118: np.full(7, 1000.0)}
+    qc = {120: np.full(7, 3e-4), 119: np.full(7, 1e-4), 118: np.zeros(7)}
+    qc[119][4] = np.nan                                                # a missing level at node 4
+    z[118][6] = np.nan                                                 # a missing height at node 6
+    gh = np.array([250.0, 700.0, 40.0, 1500.0, 250.0, np.nan, 250.0])
+    got = run_build.clmr_at_heights(qc, z, gh)
+    assert got[0] == pytest.approx(3e-4 + (250 - 100) / 300 * (1e-4 - 3e-4))   # between 120 and 119
+    assert got[1] == pytest.approx(1e-4 + (700 - 400) / 600 * (0 - 1e-4))      # between 119 and 118
+    assert got[2] == 3e-4                                              # below the lowest (under ground): 120's value
+    assert np.isnan(got[3])                                            # above the top: missing, not extrapolated
+    assert np.isnan(got[4])                                            # a bracketing level missing: missing
+    assert np.isnan(got[5]) and np.isnan(got[6])                       # missing gh / height: missing
+    # below ground needs only the lowest level: a missing level above it is irrelevant
+    assert run_build.clmr_at_heights(qc, z, np.full(7, 40.0))[4] == 3e-4
+    # exactly on a level: that level's value
+    assert run_build.clmr_at_heights(qc, z, np.full(7, 400.0))[0] == pytest.approx(1e-4)
+    assert run_build.clmr_at_heights(qc, z, np.full(7, 1000.0))[0] == pytest.approx(0.0)
+    # 2-D lattices work the same
+    z2 = {lv: a[:6].reshape(2, 3) for lv, a in z.items()}
+    q2 = {lv: a[:6].reshape(2, 3) for lv, a in qc.items()}
+    assert np.array_equal(run_build.clmr_at_heights(q2, z2, gh[:6].reshape(2, 3)).reshape(-1),
+                          got[:6], equal_nan=True)
+
+
+def test_full_level_heights_are_the_half_level_midpoints():
+    hhl = {lv: np.array([HSURF_M + HHL_AGL[lv]]) for lv in range(99, 122)}
+    z = run_build.full_level_heights(hhl, [100, 120])
+    assert z[120][0] == pytest.approx(HSURF_M + (HHL_AGL[120] + 0.0) / 2)
+    assert z[100][0] == pytest.approx(_full_msl(100))
+
+
+def test_qc_files_never_hold_the_columns_back(tmp_path, capsys):
+    # QC listed for step 0 only: the columns still publish; step 1's CLMR is
+    # missing, step 0's is there, and no other field changes.
+    steps = [0, 1]
+    deps, calls = _deps_with_columns(tmp_path, steps, qc_steps=[0])
+    assert _columns_build(tmp_path, deps, steps) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    d = decode_columns((tmp_path / "blob" / m["columns"]["tiles"] / "N40W125.icc").read_bytes())
+    P = columns.PRESSURE_HPA
+    for p in COLUMN_PLEVELS:
+        assert _value(d, columns.CLMR, P, p, s=0) == pytest.approx(_clmr_want(p, 0), abs=TOL_CLMR)
+        assert np.isnan(_value(d, columns.CLMR, P, p, s=1))
+        assert _value(d, columns.GH, P, p, s=1) == pytest.approx(8000 - 7 * p, abs=TOL_1)
+    assert sum(calls["sleeps"]) == run_build.WIND_WAIT_S                # no wait on QC (only the fake's wind)
+    assert not any("_001_" in u and "_QC." in u for u in calls["downloads"])
+    assert "QC not listed for 1 of 2 steps" in capsys.readouterr().out
+
+
+def test_a_cloud_water_failure_leaves_clmr_missing_and_the_rest_intact(tmp_path, capsys):
+    steps = [0, 1]
+    deps, _ = _deps_with_columns(tmp_path, steps)
+
+    def broken(paths, kit, work, stride, nearest=False):
+        if any("_001_" in Path(p).name and "_QC." in Path(p).name for p in paths):
+            raise OSError("cdo died")
+        return _fake_lattice_levels(paths, kit, work, stride, nearest=nearest)
+    assert _columns_build(tmp_path, deps._replace(lattice_levels=broken), steps) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    d = decode_columns((tmp_path / "blob" / m["columns"]["tiles"] / "N40W125.icc").read_bytes())
+    for p in COLUMN_PLEVELS:
+        assert np.isfinite(_value(d, columns.CLMR, columns.PRESSURE_HPA, p, s=0))
+        assert np.isnan(_value(d, columns.CLMR, columns.PRESSURE_HPA, p, s=1))
+        assert _value(d, columns.GH, columns.PRESSURE_HPA, p, s=1) == pytest.approx(8000 - 7 * p, abs=TOL_1)
+    assert "cloud water +1 failed" in capsys.readouterr().out
+
+
+def test_no_hhl_for_cloud_water_leaves_every_clmr_missing(tmp_path, capsys):
+    steps = [0, 1]
+    deps, _ = _deps_with_columns(tmp_path, steps)
+    top = min(COLUMN_QC_MLEVELS)
+
+    def broken(paths, kit, work, stride, nearest=False):
+        if any(f"_{top}_HHL." in Path(p).name for p in paths):
+            raise OSError("no such file")
+        return _fake_lattice_levels(paths, kit, work, stride, nearest=nearest)
+    assert _columns_build(tmp_path, deps._replace(lattice_levels=broken), steps) == run_build.BUILT
+    m = json.loads((tmp_path / "blob" / "manifest.json").read_text())
+    d = decode_columns((tmp_path / "blob" / m["columns"]["tiles"] / "N40W125.icc").read_bytes())
+    for s in steps:
+        assert all(np.isnan(_value(d, columns.CLMR, columns.PRESSURE_HPA, p, s=s)) for p in COLUMN_PLEVELS)
+        assert _value(d, columns.T, columns.HEIGHT_AGL_M, 80, s=s) == pytest.approx(
+            _value(d, columns.T, columns.HEIGHT_AGL_M, 80, s=s))                  # T80 still built
+        assert np.isfinite(_value(d, columns.T, columns.HEIGHT_AGL_M, 80, s=s))
+    assert "no HHL for cloud water" in capsys.readouterr().out
+
+
+def test_column_history_saved_before_clmr_is_padded_with_missing(tmp_path):
+    # A head saved by the build before CLMR (2026-11-07 .. 11-19) names its 25
+    # fields: they are a strict prefix of today's, so its six hours are used,
+    # every old field as saved and CLMR missing.
+    steps = list(range(6))
+    deps, _ = _deps_with_columns(tmp_path, steps)
+    _columns_build(tmp_path, deps, steps)
+    names = run_build.column_field_names()
+    old_names = [n for n in names if not n.startswith("CLMR@")]
+    assert names[:len(old_names)] == old_names and len(old_names) == 25          # the 26-field table minus static HSURF
+    for p in (tmp_path / "state" / "columns").glob("2026092700.h*.npz"):
+        with np.load(p) as z:
+            head, rh = z["head"], z["run_hour"]
+        np.savez_compressed(p, head=head[:, :len(old_names)], run_hour=rh, fields=np.array(old_names))
+    global RUN
+    first, RUN = RUN, RUN + dt.timedelta(hours=6)
+    try:
+        deps, _ = _deps_with_columns(tmp_path, [0, 1])
+        blob2 = tmp_path / "blob2"
+        run_build.build(site=tmp_path / "site2", state=tmp_path / "state", work=tmp_path / "work", deps=deps,
+                        pages_base="https://x", steps=[0, 1], squares=["N40W125"], workers=2, blob=blob2)
+        m = json.loads((blob2 / "manifest.json").read_text())
+        assert m["columns"]["historySteps"] == 6
+        d = decode_columns((blob2 / m["columns"]["tiles"] / "N40W125.icc").read_bytes())
+        H, P = columns.HEIGHT_AGL_M, columns.PRESSURE_HPA
+        for s in range(6):
+            assert _value(d, columns.T, H, 2, s=s) == pytest.approx(283.15 + s - 273.15, abs=TOL_T)
+            assert _value(d, columns.WW, H, 0, s=s) == _ww_code(s)
+            assert all(np.isnan(_value(d, columns.CLMR, P, p, s=s)) for p in COLUMN_PLEVELS)
+        for s in (6, 7):                                                # the new run's own hours have CLMR
+            assert _value(d, columns.CLMR, P, 700, s=s) == pytest.approx(_clmr_want(700, s - 6), abs=TOL_CLMR)
+    finally:
+        RUN = first
+
+
+def test_a_head_whose_names_are_not_a_prefix_is_skipped(tmp_path):
+    # Same field count, different names: never misread as today's layout.
+    names = run_build.column_field_names()
+    head = np.zeros((HEAD_STEPS, len(names), 2, 2), np.uint16)
+    run = dt.datetime(2026, 9, 27, 0, tzinfo=dt.timezone.utc)
+    history.save_run_head(tmp_path, run, head, sub="columns", dtype=np.uint16, split=True,
+                          fields=list(reversed(names)))
+    later = run + dt.timedelta(hours=6)
+    assert history.load_history_steps(tmp_path, later, sub="columns", shape=(len(names), 2, 2),
+                                      pad=columns.MISSING, fields=names) == []
+
+
+def _clmr_on_a_stack(qc, z, gh):
+    """The rule on a stack of every level (984df65's clmr_at_heights), kept
+    as the reference: the stream must give the same float64 bits."""
+    levels = sorted(z, reverse=True)
+    zz = np.stack([np.asarray(z[lv], dtype=np.float64) for lv in levels])
+    qq = np.stack([np.asarray(qc[lv], dtype=np.float64) for lv in levels])
+    gh = np.asarray(gh, dtype=np.float64)
+    n = len(levels)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        up = np.clip(np.sum(zz <= gh, axis=0), 1, n - 1)
+        lo = up - 1
+        pick = lambda a, i: np.take_along_axis(a, i[None], 0)[0]
+        f = np.clip((gh - pick(zz, lo)) / (pick(zz, up) - pick(zz, lo)), 0.0, 1.0)
+        out = pick(qq, lo) + f * (pick(qq, up) - pick(qq, lo))
+        out = np.where(gh <= zz[0], qq[0], out)
+        out = np.where(gh > zz[-1], np.nan, out)
+    return np.where(~np.isfinite(gh) | np.any(~np.isfinite(zz), axis=0), np.nan, out)
+
+
+def test_the_cloud_water_stream_gives_the_stack_rules_exact_bits():
+    rng = np.random.default_rng(3)
+    shape = (40, 50)
+    levels = list(range(99, 121))
+    # heights rising ~280 m a level from a ground at 0-3000 m, float32 as remapped
+    ground = rng.uniform(0, 3000, shape)
+    half = {lv: (ground + 20.0 * (121 - lv) ** 1.6).astype(np.float32) for lv in range(99, 122)}
+    half[110][3, 4] = np.nan                                         # a missing height
+    z = run_build.full_level_heights(half, levels)
+    qc = {lv: (rng.lognormal(-10, 2, shape) * (rng.random(shape) > 0.3)).astype(np.float32) for lv in levels}
+    qc[105][rng.random(shape) < 0.05] = np.nan                       # missing QC on one level
+    ghs = []
+    for base in (100.0, 1500.0, 3000.0, 9000.0):                     # below ground .. above the top
+        g = (base + rng.uniform(-800, 800, shape)).astype(np.float32)
+        g[0, :5] = z[120][0, :5].astype(np.float32)                  # on (or a hair off) the lowest level
+        g[1, :5] = z[99][1, :5].astype(np.float32)                   # on the top level
+        g[2, 0] = np.nan
+        ghs.append(g)
+    s = run_build.ClmrStream(ghs, lambda lv: run_build._full_level(half, lv), levels)
+    for lv in s.levels:
+        s.add(lv, qc[lv])
+    for g, got in zip(ghs, s.result()):
+        want = _clmr_on_a_stack(qc, z, g)
+        assert np.array_equal(got, want, equal_nan=True)
+        assert np.isfinite(got).any() or np.isnan(want).all()
+    assert np.array_equal(run_build.clmr_at_heights(qc, z, ghs[1]), _clmr_on_a_stack(qc, z, ghs[1]), equal_nan=True)
+
+
+def test_the_cloud_water_stream_holds_two_qc_levels_and_the_lowest_never_all():
+    import gc
+    import weakref
+    levels = list(range(99, 121))
+    half = {lv: np.full(3, 20.0 * (121 - lv) ** 1.6, np.float32) for lv in range(99, 122)}
+    s = run_build.ClmrStream([np.full(3, 900.0, np.float32)], lambda lv: run_build._full_level(half, lv), levels)
+    refs = []
+    for lv in s.levels:
+        a = np.full(3, 1e-5 * lv, np.float32)
+        refs.append(weakref.ref(a))
+        s.add(lv, a)
+        del a
+        gc.collect()
+        alive = sum(r() is not None for r in refs)
+        assert alive <= 3, alive                                     # the lowest, the previous, the latest
+    with pytest.raises(ValueError):
+        s.add(98, np.zeros(3, np.float32))                           # one level too many
+    s2 = run_build.ClmrStream([np.zeros(3)], lambda lv: run_build._full_level(half, lv), levels)
+    with pytest.raises(ValueError):
+        s2.add(119, np.zeros(3))                                     # lowest first, always
+    with pytest.raises(ValueError):
+        s2.result()                                                  # not every level fed

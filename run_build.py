@@ -595,7 +595,8 @@ def column_keys():
     keys = []
     for p in dwd.COLUMN_PLEVELS:
         keys += [("T", p), ("RELHUM", p), ("FI", p)]
-    return keys + [("T_2M", None), ("RELHUM_2M", None), ("T_80M", None), ("WW", None)]
+    return (keys + [("T_2M", None), ("RELHUM_2M", None), ("T_80M", None), ("WW", None)]
+            + [("CLMR", p) for p in dwd.COLUMN_PLEVELS])
 
 
 def column_field_names():
@@ -617,6 +618,8 @@ def _to_codes(key, arr):
         return columns.quantize(arr, *columns._QUANT[columns.RH])
     if field == "FI":
         return columns.quantize(arr / G, *columns._QUANT[columns.GH])
+    if field == "CLMR":
+        return columns.quantize(arr, *columns._QUANT[columns.CLMR])        # kg/kg, as HRRR's
     if field == "WW":
         # A WMO 4677 code, whole. Anything outside 0..99 is MISSING, never
         # clipped: 99 is "thunderstorm with heavy hail", and garbage must
@@ -653,6 +656,116 @@ def t80_weights(hhl, hsurf):
     for lv in levels:
         bad |= ~np.isfinite(z[lv])
     return {lv: np.where(bad, np.nan, w[lv]) for lv in levels}
+
+
+def _full_level(hhl, lv):
+    """Full level lv's height MSL, float64: midway between its half levels lv
+    and lv + 1 (121 is the ground)."""
+    return (np.asarray(hhl[lv], dtype=np.float64) + np.asarray(hhl[lv + 1], dtype=np.float64)) / 2
+
+
+def full_level_heights(hhl, levels):
+    """hhl: {half level: height MSL} → {full level: height MSL}, a full level
+    midway between its two half levels (level k between half levels k and
+    k + 1; 121 is the ground)."""
+    return {lv: _full_level(hhl, lv) for lv in levels}
+
+
+class ClmrStream:
+    """Cloud water at several height lattices (`ghs`: [m MSL], any shape,
+    e.g. one per pressure level) from model levels fed ONE AT A TIME, lowest
+    first (`add`), so a step holds three QC levels at most (the lowest, the
+    previous, the latest), never all of them. `height(lv)`
+    gives full level lv's height MSL (float64); `levels` are the model levels
+    to be fed, any order (sorted here, lowest = highest number first).
+
+    The rule (clmr_at_heights): linear in height between the two adjacent
+    levels that bracket gh (as t80_weights does for T at 80 m); at or below
+    the lowest level — the model ground included — the lowest level's value;
+    above the highest, NaN (missing, never extrapolated;
+    dwd.COLUMN_QC_MLEVELS is chosen so that this does not happen at 700 hPa).
+    NaN in, NaN out: a missing gh, a missing height on any level, or a
+    missing QC on either bracketing level.
+
+    Memory per stream: per gh a u8 pair index and a float64 result (1 B and 8
+    B a node), plus those QC levels and two full-level heights in flight. The bracketing pair is found from the heights alone (pass 1:
+    count of levels at or below gh, so the pair is exactly the one a stack of
+    every level would pick), then each pair's nodes are filled as its upper
+    level arrives (pass 2). All arithmetic is float64, element for element
+    the same as on the full stack, so the codes are the same bytes."""
+
+    def __init__(self, ghs, height, levels):
+        self.levels = sorted(levels, reverse=True)           # bottom first: 120 is the lowest
+        if len(self.levels) < 2:
+            raise ValueError("cloud water needs two model levels at least")
+        self.height = height
+        self.ghs = list(ghs)
+        n = len(self.levels)
+        count = [np.zeros(np.shape(g), np.uint8) for g in self.ghs]
+        self.zbad = np.zeros(np.shape(self.ghs[0]), bool)
+        with np.errstate(invalid="ignore"):
+            for lv in self.levels:
+                z = height(lv)
+                self.zbad |= ~np.isfinite(z)
+                for c, g in zip(count, self.ghs):
+                    c += z <= g                                 # levels at or below gh (f32 gh rises to f64 exactly)
+        self.up = [np.clip(c, 1, n - 1) for c in count]        # the pair's upper level, as an index
+        del count
+        self.out = [np.full(np.shape(g), np.nan) for g in self.ghs]
+        self.i = 0
+        self.q0 = self.q_prev = self.z_prev = None
+
+    def add(self, lv, qc):
+        """Feed model level lv's QC (kg/kg, lattice like gh); lowest first."""
+        if self.i >= len(self.levels) or lv != self.levels[self.i]:
+            want = self.levels[self.i] if self.i < len(self.levels) else "none"
+            raise ValueError(f"cloud water: level {lv} fed, {want} expected")
+        z = self.height(lv)
+        if self.i == 0:
+            self.q0 = qc
+        else:
+            for up, out, g in zip(self.up, self.out, self.ghs):
+                m = up == self.i
+                if not m.any():
+                    continue
+                z_lo, z_up = self.z_prev[m], z[m]
+                q_lo = np.asarray(self.q_prev)[m].astype(np.float64)
+                q_up = np.asarray(qc)[m].astype(np.float64)
+                gm = np.asarray(g)[m].astype(np.float64)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    f = np.clip((gm - z_lo) / (z_up - z_lo), 0.0, 1.0)
+                    out[m] = q_lo + f * (q_up - q_lo)
+        self.q_prev, self.z_prev = qc, z
+        self.i += 1
+
+    def result(self):
+        """[float64 lattice like each gh], once every level is fed."""
+        if self.i != len(self.levels):
+            raise ValueError(f"cloud water: {self.i} of {len(self.levels)} levels fed")
+        z0 = self.height(self.levels[0])
+        ztop = self.z_prev
+        q0 = np.asarray(self.q0)
+        res = []
+        with np.errstate(invalid="ignore"):
+            for out, g in zip(self.out, self.ghs):
+                bottom = g <= z0
+                out[bottom] = q0[bottom].astype(np.float64)    # below the lowest level: its value alone
+                out[g > ztop] = np.nan                          # above the highest: missing
+                out[~np.isfinite(g) | self.zbad] = np.nan
+                res.append(out)
+        self.out = self.q0 = self.q_prev = self.z_prev = None
+        return res
+
+
+def clmr_at_heights(qc, z, gh):
+    """Cloud water at heights `gh` (m MSL, any array shape) from model levels:
+    qc, z: {full level: array like gh} — the level's QC (kg/kg) and its full-
+    level height (m MSL). The rule is ClmrStream's (this feeds it every level
+    of the dicts)."""
+    s = ClmrStream([gh], lambda lv: np.asarray(z[lv], dtype=np.float64), list(z))
+    for lv in s.levels:
+        s.add(lv, qc[lv])
+    return s.result()[0]
 
 
 def _wait_for_files(deps, run, what, wait_s, missing_now):
@@ -716,24 +829,68 @@ def _only(levels):
 
 
 def column_statics(deps, kit, work, run, stride):
-    """(HSURF lattice codes [1][LY][LX], {model level: T80 weight lattice}) — once per run."""
+    """(HSURF lattice codes [1][LY][LX], {model level: T80 weight lattice},
+    {HHL half level: height MSL lattice, as remapped (float32)} for the cloud
+    water's levels, or None) — once per run. The half levels are kept, not
+    float64 full levels: half the memory, and each step makes the full
+    levels from them exactly as before (_full_level). The QC heights' extra
+    HHL levels are fetched apart: if they fail, CLMR is missing for the run
+    and nothing else changes."""
     hsurf = _only(_fetch_levels(deps, kit, work, [dwd.invariant_file_name(run, "HSURF")], run, "HSURF", stride))
     hhl = {}
-    for lv in dwd.COLUMN_HHL_LEVELS:          # one cdo call each: no level axis to trust
-        name = dwd.invariant_file_name(run, "HHL", lv)
-        hhl[lv] = _only(_fetch_levels(deps, kit, work, [name], run, "HHL", stride))
+
+    def fetch_hhl(levels):
+        for lv in levels:                     # one cdo call each: no level axis to trust
+            if lv not in hhl:
+                name = dwd.invariant_file_name(run, "HHL", lv)
+                hhl[lv] = _only(_fetch_levels(deps, kit, work, [name], run, "HHL", stride))
+    fetch_hhl(dwd.COLUMN_HHL_LEVELS)
     static = columns.quantize(hsurf, *columns._QUANT[columns.HSURF])[None]
-    return static, t80_weights(hhl, hsurf)
+    try:
+        fetch_hhl(dwd.COLUMN_QC_HHL_LEVELS)
+        hqc = {lv: hhl[lv] for lv in dwd.COLUMN_QC_HHL_LEVELS}
+    except Exception as e:
+        print(f"::warning::columns: no HHL for cloud water ({type(e).__name__}: {e}) — CLMR missing")
+        hqc = None
+    return static, t80_weights({lv: hhl[lv] for lv in dwd.COLUMN_HHL_LEVELS}, hsurf), hqc
 
 
-def column_step(deps, kit, work, run, step, group, stride, w80):
-    """One step's share of the column fields: {key: lattice u16 codes}."""
+def _clmr_codes(deps, kit, work, run, step, stride, gh, hqc):
+    """{("CLMR", p): codes} for one step: QC on dwd.COLUMN_QC_MLEVELS
+    interpolated in height to each pressure level's GH (gh: {hPa: m MSL});
+    every code MISSING when hqc (the half-level heights) is None. QC is
+    fetched and folded in one level at a time, lowest first (ClmrStream):
+    never all 22 levels at once."""
+    if hqc is None:
+        return {("CLMR", p): np.full(np.shape(gh[p]), columns.MISSING, np.uint16) for p in dwd.COLUMN_PLEVELS}
+    s = ClmrStream([gh[p] for p in dwd.COLUMN_PLEVELS], lambda lv: _full_level(hqc, lv), dwd.COLUMN_QC_MLEVELS)
+    for lv in s.levels:                       # one cdo call each, as T on model levels
+        s.add(lv, _only(_fetch_levels(deps, kit, work, [dwd.model_file_name(run, step, lv, "QC")],
+                                      run, "QC", stride)))
+    return {("CLMR", p): _to_codes(("CLMR", p), v) for p, v in zip(dwd.COLUMN_PLEVELS, s.result())}
+
+
+def column_step(deps, kit, work, run, step, group, stride, w80, hqc=None, qc_steps=()):
+    """One step's share of the column fields: {key: lattice u16 codes}. The
+    FI group also yields the step's CLMR: cloud water needs that step's GH,
+    and doing both in one job keeps no extra global arrays alive. A cloud-
+    water failure (or a step whose QC files are not in `qc_steps`) leaves
+    CLMR missing with a warning; it never fails the step."""
     if group in dwd.COLUMN_PFIELDS:
         names = [dwd.pressure_file_name(run, step, lv, group) for lv in dwd.COLUMN_PLEVELS]
         levels = _fetch_levels(deps, kit, work, names, run, group, stride)
         if sorted(levels) != sorted(dwd.COLUMN_PLEVELS):
             raise ValueError(f"{group} +{step}: levels {sorted(levels, key=str)}, wanted {dwd.COLUMN_PLEVELS}")
-        return {(group, lv): _to_codes((group, lv), levels[lv]) for lv in dwd.COLUMN_PLEVELS}
+        out = {(group, lv): _to_codes((group, lv), levels[lv]) for lv in dwd.COLUMN_PLEVELS}
+        if group == "FI":
+            gh = {p: levels[p] / G for p in dwd.COLUMN_PLEVELS}
+            try:
+                out.update(_clmr_codes(deps, kit, work, run, step, stride, gh,
+                                       hqc if step in qc_steps else None))
+            except Exception as e:
+                print(f"::warning::columns: cloud water +{step} failed ({type(e).__name__}: {e}) — CLMR missing")
+                out.update(_clmr_codes(deps, kit, work, run, step, stride, gh, None))
+        return out
     if group in dwd.COLUMN_SFIELDS:
         arr = _only(_fetch_levels(deps, kit, work, [dwd.file_name(run, step, group)], run, group, stride,
                                   nearest=group == "WW"))
@@ -766,7 +923,13 @@ def fetch_columns(deps, kit, work, run, steps, workers, stride):
     work = Path(work)
     with _CLOCK_LOCK:
         _CLOCK.clear()
-    static, w80 = column_statics(deps, kit, work, run, stride)
+    static, w80, hqc = column_statics(deps, kit, work, run, stride)
+    # The QC files never hold the columns back (dwd.column_qc_files): a step
+    # whose QC is not listed now gets CLMR missing.
+    qc_steps = set(dwd.listed_qc_steps(deps.listing, run, steps)) if hqc is not None else set()
+    if hqc is not None and len(qc_steps) < len(steps):
+        print(f"::warning::columns: QC not listed for {len(steps) - len(qc_steps)} of {len(steps)} steps "
+              f"of run {dwd.run_iso(run)} — CLMR missing there")
     keys = column_keys()
     row = {k: i for i, k in enumerate(keys)}
     at = {s: i for i, s in enumerate(steps)}
@@ -781,7 +944,7 @@ def fetch_columns(deps, kit, work, run, steps, workers, stride):
     filled = np.zeros((len(steps), len(keys)), dtype=bool)
 
     def job(s, g):
-        out = column_step(deps, kit, work, run, s, g, stride, w80)
+        out = column_step(deps, kit, work, run, s, g, stride, w80, hqc, qc_steps)
         done = [k for k in out if k in row]
         for k in done:
             cube[at[s], row[k]] = out[k]
@@ -830,8 +993,8 @@ def build_columns(blob_dir, state, work, deps, kit, run, steps, names, workers, 
         if not _wait_for_column_files(deps, run, steps):
             return None
         static, own = fetch_columns(deps, kit, work, run, steps, column_fetch_workers(), stride)
-        # pad: a head saved before a field was appended (WW, 2026-11-07) is
-        # still six good hours, the new field missing.
+        # pad: a head saved before a field was appended (WW, 2026-11-07; CLMR,
+        # 2026-11-19) is still six good hours, the new fields missing.
         past = history.load_history_steps(state, run, sub="columns", shape=own[0][1].shape,
                                           pad=columns.MISSING, fields=column_field_names())
         stacks = past + own
