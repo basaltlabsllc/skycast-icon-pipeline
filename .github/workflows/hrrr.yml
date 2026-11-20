@@ -43,7 +43,11 @@ jobs:
           # The 3 km fog columns build in the BACKGROUND (up to 30 min), so they
           # never hold up the next cloud check: a pass is a finished fog build's
           # publish (a few min) + cloud build <=20 + its publish + 5 min sleep,
-          # about 32 min at most. All publishes run here in the foreground, one
+          # about 32 min at most. The smoke pass (hrrr_smoke_build.py <=15 min +
+          # its publish ~3) runs only with >=16 min of the loop left, so it ends
+          # by loop end + 2 min (+5 sleep = 7): a pass that reaches it late skips
+          # it, and the worst last pass stays the 32 min above (never 47-50).
+          # All publishes run here in the foreground, one
           # at a time, so a fog manifest never races a cloud manifest.
           # ~5 min setup + 285 min loop + <=32 min last pass, then a running fog
           # build is waited for until 320 min (else stopped; the next run rebuilds
@@ -119,16 +123,23 @@ jobs:
             # start, in this same step so its manifest never races the cover's
             # (publish/smoke.mjs writes only smoke/). Whatever happens here never
             # touches rc (the cover's exit code, read above) and never ends the loop.
-            set +e
-            timeout -k 10 900 python hrrr_smoke_build.py --out site-hrrr-smoke --live-index "$HRRR_BASE/smoke/latest.json"
-            src=$?
-            set -e
-            if [ "$src" = "0" ]; then
-              (cd publish && node smoke.mjs ../site-hrrr-smoke) || echo "smoke publish failed, will retry"
-            elif [ "$src" != "3" ]; then
-              echo "hrrr_smoke_build.py failed (exit $src), retrying next pass"
+            # Skipped when less than 16 min (960 s: the 900 s timeout plus slack)
+            # of the loop is left, so it can never push the job past the budget;
+            # the next run's loop picks it up.
+            if [ $(( end - $(date +%s) )) -ge 960 ]; then
+              set +e
+              timeout -k 10 900 python hrrr_smoke_build.py --out site-hrrr-smoke --live-index "$HRRR_BASE/smoke/latest.json"
+              src=$?
+              set -e
+              if [ "$src" = "0" ]; then
+                (cd publish && node smoke.mjs ../site-hrrr-smoke) || echo "smoke publish failed, will retry"
+              elif [ "$src" != "3" ]; then
+                echo "hrrr_smoke_build.py failed (exit $src), retrying next pass"
+              fi
+              rm -rf site-hrrr-smoke
+            else
+              echo "smoke pass skipped: under 16 min of the loop left, the next run's loop does it"
             fi
-            rm -rf site-hrrr-smoke
             sleep 300
           done
           # Past the loop: give a running fog build until $drain, then stop it.

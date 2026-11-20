@@ -223,13 +223,16 @@ def test_smoke_runs_each_pass_after_the_cover_and_never_changes_the_cover(tmp_pa
     smoke_rcs = [0, 0, 1, 3]
     p, events = run_loop(tmp_path, BUILD_RCS, FOGS, smoke_rcs)
     base, builds, _, _ = expected_events(BUILD_RCS, FOGS)
+    # passes start every 300 s; smoke runs only with >= 960 s of the loop left
+    smoke_passes = sum(1 for k in range(builds) if END - k * 300 >= 960)
+    assert 0 < smoke_passes < builds and "smoke pass skipped" in p.stdout
     # the cover's own events (builds, publishes, fog) are exactly what they are without smoke
     assert events == base
     assert (tmp_path / "smoke_args").read_text().splitlines() == [
-        "--out site-hrrr-smoke --live-index https://blob.example/smoke/latest.json"] * builds
+        "--out site-hrrr-smoke --live-index https://blob.example/smoke/latest.json"] * smoke_passes
     sev = (tmp_path / "smoke_events").read_text().splitlines()
     assert [e for e in sev if e.startswith("smokebuild")] == [
-        f"smokebuild {rc} cover_builds={i + 1}" for i, rc in enumerate((smoke_rcs + [3] * builds)[:builds])]
+        f"smokebuild {rc} cover_builds={i + 1}" for i, rc in enumerate((smoke_rcs + [3] * builds)[:smoke_passes])]
     # only a smoke build that exited 0 is published, right after it
     for i, e in enumerate(sev):
         if e == "smokepublish":
@@ -284,6 +287,11 @@ def test_workflow_text_pins():
     assert text.index("node blob.mjs ../site-hrrr)") < text.index(smoke)
     assert "(cd publish && node smoke.mjs ../site-hrrr-smoke)" in text
     assert text.index(smoke) < text.index("node smoke.mjs ../site-hrrr-smoke") < text.index("rm -rf site-hrrr-smoke")
+    # the smoke step is guarded by a deadline check of at least 960 s (16 min)
+    guard = "if [ $(( end - $(date +%s) )) -ge 960 ]; then"
+    assert text.count(guard) == 1
+    assert text.index(guard) < text.index(smoke)
+    assert "smoke pass skipped" in text
     assert text.count("            rc=$?\n") == 1 and text.count("src=$?") == 1   # smoke has its own exit variable; the cover's rc is never reassigned
     redispatch = text.split("name: start the next run")[1]
     assert "steps.loop.conclusion != 'skipped'" in redispatch.split("run:")[0]
